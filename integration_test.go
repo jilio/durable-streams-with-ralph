@@ -2,7 +2,6 @@ package durablestreams
 
 import (
 	"context"
-	"encoding/json"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -228,25 +227,27 @@ func TestIntegration_OffsetResumption(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create stream with multiple messages
-	storage.Create(ctx, stream.StreamConfig{
-		Path:        "/test/stream",
-		ContentType: "application/json",
-	})
-	str, _ := storage.Get(ctx, "/test/stream")
+	c := client.New(ts.URL+"/test/stream", client.WithContentType("application/json"))
 
-	// Append 5 messages, track middle offset
+	// Create stream
+	err := c.Create(ctx, client.CreateOptions{ContentType: "application/json"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Append 5 messages via client, track middle offset
 	var middleOffset stream.Offset
 	for i := 0; i < 5; i++ {
-		data, _ := json.Marshal(map[string]int{"index": i})
-		offset, _ := str.Append(ctx, data)
+		offset, err := c.AppendJSON(ctx, map[string]int{"index": i})
+		if err != nil {
+			t.Fatalf("AppendJSON() error = %v", err)
+		}
 		if i == 2 {
 			middleOffset = offset
 		}
 	}
 
 	// Read from middle offset
-	c := client.New(ts.URL + "/test/stream")
 	result, err := c.Read(ctx, middleOffset)
 	if err != nil {
 		t.Fatalf("Read() error = %v", err)

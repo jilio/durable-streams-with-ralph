@@ -303,16 +303,13 @@ func TestClient_Read(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create stream with data
-	storage.Create(ctx, stream.StreamConfig{
-		Path:        "/test/stream",
-		ContentType: "application/json",
-	})
-	str, _ := storage.Get(ctx, "/test/stream")
-	str.Append(ctx, []byte(`{"event":"first"}`))
-	str.Append(ctx, []byte(`{"event":"second"}`))
+	c := New(ts.URL+"/test/stream", WithContentType("application/json"))
 
-	c := New(ts.URL + "/test/stream")
+	// Create stream with data via client
+	c.Create(ctx, CreateOptions{ContentType: "application/json"})
+	c.AppendJSON(ctx, map[string]string{"event": "first"})
+	c.AppendJSON(ctx, map[string]string{"event": "second"})
+
 	result, err := c.Read(ctx, stream.StartOffset)
 	if err != nil {
 		t.Fatalf("Read() error = %v", err)

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -249,16 +250,74 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 
-	// Append the data
-	nextOffset, err := str.Append(ctx, body)
-	if err != nil {
-		http.Error(w, "Failed to append data", http.StatusInternalServerError)
-		return
+	var nextOffset stream.Offset
+
+	// For JSON content-type, parse and handle array unwrapping
+	if isJSONContentType(str.ContentType()) {
+		messages, err := processJSONAppend(body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Append each message
+		for _, msg := range messages {
+			nextOffset, err = str.Append(ctx, msg)
+			if err != nil {
+				http.Error(w, "Failed to append data", http.StatusInternalServerError)
+				return
+			}
+		}
+	} else {
+		// Binary mode: append raw data
+		nextOffset, err = str.Append(ctx, body)
+		if err != nil {
+			http.Error(w, "Failed to append data", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Set response headers
 	w.Header().Set(HeaderStreamOffset, string(nextOffset))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// processJSONAppend parses JSON body and returns messages to append.
+// If body is an array, each element becomes a separate message.
+// If body is a single value, it becomes one message.
+// Empty arrays are rejected.
+func processJSONAppend(body []byte) ([][]byte, error) {
+	// Parse JSON
+	var parsed interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("Invalid JSON")
+	}
+
+	// Check if it's an array
+	if arr, ok := parsed.([]interface{}); ok {
+		if len(arr) == 0 {
+			return nil, fmt.Errorf("Empty arrays are not allowed")
+		}
+
+		// Each element becomes a separate message with trailing comma
+		messages := make([][]byte, len(arr))
+		for i, item := range arr {
+			data, err := json.Marshal(item)
+			if err != nil {
+				return nil, fmt.Errorf("Invalid JSON")
+			}
+			// Add trailing comma for concatenation
+			messages[i] = append(data, ',')
+		}
+		return messages, nil
+	}
+
+	// Single value - store as single message with trailing comma
+	data, err := json.Marshal(parsed)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid JSON")
+	}
+	return [][]byte{append(data, ',')}, nil
 }
 
 // handleDelete handles DELETE requests to remove a stream.
@@ -422,21 +481,42 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 
 	// Format response
 	if isJSONContentType(str.ContentType()) {
-		// JSON mode: wrap messages in array
-		w.Write([]byte("["))
-		for i, msg := range batch.Messages {
-			if i > 0 {
-				w.Write([]byte(","))
-			}
-			w.Write(msg.Data)
-		}
-		w.Write([]byte("]"))
+		// JSON mode: messages are stored with trailing commas
+		// Concatenate all and wrap in [], stripping final comma
+		response := formatJSONResponse(batch.Messages)
+		w.Write(response)
 	} else {
 		// Binary mode: concatenate raw data
 		for _, msg := range batch.Messages {
 			w.Write(msg.Data)
 		}
 	}
+}
+
+// formatJSONResponse concatenates JSON messages and wraps in array.
+// Messages are stored with trailing commas for easy concatenation.
+func formatJSONResponse(messages []stream.Message) []byte {
+	if len(messages) == 0 {
+		return []byte("[]")
+	}
+
+	// Concatenate all message data
+	var buf []byte
+	for _, msg := range messages {
+		buf = append(buf, msg.Data...)
+	}
+
+	// Strip trailing comma if present
+	if len(buf) > 0 && buf[len(buf)-1] == ',' {
+		buf = buf[:len(buf)-1]
+	}
+
+	// Wrap in array brackets
+	result := make([]byte, 0, len(buf)+2)
+	result = append(result, '[')
+	result = append(result, buf...)
+	result = append(result, ']')
+	return result
 }
 
 // handleSSE handles Server-Sent Events streaming.
@@ -478,14 +558,20 @@ func (s *Server) handleSSE(ctx context.Context, w http.ResponseWriter, str strea
 			var dataPayload string
 			if isJsonStream {
 				// Wrap single message in array for JSON streams
-				dataPayload = "[" + string(msg.Data) + "]"
+				// Messages are stored with trailing comma, strip it and wrap
+				data := msg.Data
+				if len(data) > 0 && data[len(data)-1] == ',' {
+					data = data[:len(data)-1]
+				}
+				dataPayload = "[" + string(data) + "]"
 			} else {
 				dataPayload = string(msg.Data)
 			}
 
-			// Send data event
+			// Send data event - handle newlines properly for SSE
 			w.Write([]byte("event: data\n"))
-			w.Write([]byte("data: " + dataPayload + "\n\n"))
+			w.Write(formatSSEData(dataPayload))
+			w.Write([]byte("\n"))
 			currentOffset = msg.Offset
 		}
 
@@ -567,6 +653,27 @@ func encodeJSON(v interface{}) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+// formatSSEData formats data for SSE, handling newlines.
+// SSE requires each line of data to be prefixed with "data: ".
+// Newlines (\n, \r, or \r\n) must be split across multiple data: lines.
+func formatSSEData(payload string) []byte {
+	// Replace CR and CRLF with LF for consistent handling
+	payload = strings.ReplaceAll(payload, "\r\n", "\n")
+	payload = strings.ReplaceAll(payload, "\r", "\n")
+
+	lines := strings.Split(payload, "\n")
+	var result []byte
+	for i, line := range lines {
+		if i > 0 {
+			result = append(result, '\n')
+		}
+		result = append(result, []byte("data: ")...)
+		result = append(result, []byte(line)...)
+	}
+	result = append(result, '\n')
+	return result
 }
 
 // parseTTL parses and validates a TTL header value.
