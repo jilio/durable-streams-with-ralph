@@ -5,6 +5,10 @@ Port the durable-streams protocol to Go.
 ## Reference
 - Original: https://github.com/durable-streams/durable-streams
 - Protocol: HTTP-based streaming with offset-based resumability
+- **Reference implementation is in `reference/` directory** - study it!
+- Read `reference/PROTOCOL.md` for protocol specification
+- Study `reference/packages/server/src/` for server implementation patterns
+- Study `reference/packages/server-conformance-tests/src/` for test cases
 
 ---
 
@@ -40,12 +44,21 @@ Each iteration you work on exactly ONE task:
 4. Run all tests: `go test ./...`
 5. Refactor if needed (keep tests green)
 
+### Test Coverage Requirement
+Go code must have >= 80% test coverage:
+```bash
+go test ./... -coverprofile=coverage.out
+go tool cover -func=coverage.out
+```
+
 ### Commit Rules (STRICT)
-Commit and push ONLY when `go test ./...` exits with code 0.
+Commit and push ONLY when:
+- `go test ./...` exits with code 0
+- Test coverage >= 80%
 
 ```bash
-go test ./...
-# If exit code 0:
+go test ./... -coverprofile=coverage.out
+# If exit code 0 and coverage >= 80%:
 git add -A && git commit -m "message" && git push
 bd done <task-id>
 ```
@@ -102,14 +115,58 @@ Depends on Epic 5.
 - sgl: Example client
 - 7ga: Update README
 
+### Epic 7: Conformance & Benchmarks (t4l)
+Depends on Epic 6.
+- ifi: Pass all 195 conformance tests
+- oiy: Match reference server benchmarks
+
+---
+
+## Conformance Testing
+
+Run conformance tests against your Go server:
+```bash
+# Start your Go server on port 8080
+go run ./cmd/server
+
+# In another terminal, run conformance tests
+bun run conformance:go
+```
+
+Run against reference server to verify test setup:
+```bash
+# Start reference server on port 4437
+bun run reference:start
+
+# Run conformance tests
+bun run conformance:reference
+```
+
+All 195 tests must pass. If tests fail against reference server, the problem is in your test setup, not the reference server.
+
+---
+
+## Benchmarks
+
+Compare performance:
+```bash
+bun run benchmark:go        # Test Go server
+bun run benchmark:reference # Test reference server
+```
+
+Go server should match or exceed reference server performance.
+
 ---
 
 ## Completion Criteria
 
 The loop stops when ALL of the following are true:
-- All 6 epics closed
+- All 7 epics closed
 - `bd ready` shows "No open issues"
 - `go test ./...` passes with exit code 0
+- Test coverage >= 80%
+- All 195 conformance tests pass
+- Benchmarks match or exceed reference server
 - Example server and client run successfully
 
 When ALL criteria are met, output exactly:

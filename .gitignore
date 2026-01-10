@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+bun.lock
+
+# Reference implementation (cloned separately)
+reference/
+
+# Go
+coverage.out
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.temp

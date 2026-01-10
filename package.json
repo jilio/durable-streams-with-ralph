@@ -1,0 +1,16 @@
+{
+  "name": "durable-streams-with-ralph",
+  "version": "0.1.0",
+  "description": "Go port of durable-streams with conformance testing",
+  "scripts": {
+    "reference:start": "bun run --cwd reference start:dev",
+    "conformance:go": "bun scripts/run-conformance.ts http://localhost:8080",
+    "conformance:reference": "bun scripts/run-conformance.ts http://localhost:4437",
+    "benchmark:go": "bun scripts/run-benchmark.ts http://localhost:8080",
+    "benchmark:reference": "bun scripts/run-benchmark.ts http://localhost:4437",
+    "test:go": "go test ./... -v",
+    "test:go:coverage": "go test ./... -coverprofile=coverage.out && go tool cover -func=coverage.out",
+    "start:go": "go run ./cmd/server"
+  },
+  "devDependencies": {}
+}
