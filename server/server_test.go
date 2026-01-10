@@ -899,3 +899,87 @@ func TestServer_DeleteStreamNotFound(t *testing.T) {
 		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
+
+// HEAD tests
+
+func TestServer_HeadStream(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// HEAD request
+	req := httptest.NewRequest(http.MethodHead, "/test/stream", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// Check headers
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if offset := resp.Header.Get("Stream-Next-Offset"); offset == "" {
+		t.Error("Stream-Next-Offset header missing")
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "no-store")
+	}
+
+	// Body should be empty for HEAD
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) != 0 {
+		t.Errorf("Body = %q, want empty", body)
+	}
+}
+
+func TestServer_HeadStreamNotFound(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	req := httptest.NewRequest(http.MethodHead, "/nonexistent/stream", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestServer_HeadStreamAfterAppend(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	initialOffset := w.Result().Header.Get("Stream-Next-Offset")
+
+	// Append data
+	body := strings.NewReader(`{"event":"test"}`)
+	appendReq := httptest.NewRequest(http.MethodPost, "/test/stream", body)
+	appendReq.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, appendReq)
+
+	// HEAD should show updated offset
+	req := httptest.NewRequest(http.MethodHead, "/test/stream", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	newOffset := w.Result().Header.Get("Stream-Next-Offset")
+	if newOffset == initialOffset {
+		t.Error("Stream-Next-Offset should be updated after append")
+	}
+}

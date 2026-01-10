@@ -76,6 +76,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAppend(w, r, path)
 	case http.MethodDelete:
 		s.handleDelete(w, r, path)
+	case http.MethodHead:
+		s.handleHead(w, r, path)
 	case http.MethodOptions:
 		s.handleOptions(w, r)
 	default:
@@ -247,6 +249,29 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleHead handles HEAD requests to get stream metadata.
+func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, path string) {
+	ctx := r.Context()
+
+	// Get stream metadata
+	meta, err := s.storage.Head(ctx, path)
+	if err == stream.ErrStreamNotFound {
+		http.Error(w, "Stream not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "Failed to get stream metadata", http.StatusInternalServerError)
+		return
+	}
+
+	// Set headers
+	w.Header().Set(HeaderContentType, meta.ContentType)
+	w.Header().Set(HeaderStreamOffset, string(meta.NextOffset))
+	w.Header().Set("Cache-Control", "no-store")
+
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleRead handles GET requests to read from a stream.
