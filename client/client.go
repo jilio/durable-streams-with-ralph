@@ -365,6 +365,152 @@ func (c *Client) isJSONContentType(ct string) bool {
 	return ct == "application/json" || ct == "application/json; charset=utf-8"
 }
 
+// SubscribeOptions configures subscription behavior.
+type SubscribeOptions struct {
+	// Offset is the starting offset to subscribe from.
+	// Use stream.StartOffset ("-1") to read from the beginning.
+	// Use stream.NowOffset ("now") to start from the current tail.
+	Offset stream.Offset
+}
+
+// Subscription represents an active subscription to a stream.
+// Messages are delivered via the Messages channel.
+// Call Cancel() to stop the subscription.
+type Subscription struct {
+	// Messages is the channel that receives stream messages.
+	// The channel is closed when the subscription ends.
+	Messages <-chan *ReadResult
+
+	// Err returns the error that caused the subscription to end, if any.
+	Err func() error
+
+	// Cancel stops the subscription and closes the Messages channel.
+	Cancel func()
+
+	// Offset returns the current offset (last received offset).
+	Offset func() stream.Offset
+}
+
+// Subscribe starts a long-poll subscription to the stream.
+// Messages are delivered to the returned Subscription.Messages channel.
+// The subscription runs until ctx is cancelled or an error occurs.
+func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) *Subscription {
+	msgCh := make(chan *ReadResult, 10)
+	var subscriptionErr error
+	currentOffset := opts.Offset
+	if currentOffset == "" {
+		currentOffset = stream.StartOffset
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	sub := &Subscription{
+		Messages: msgCh,
+		Err:      func() error { return subscriptionErr },
+		Cancel:   cancel,
+		Offset:   func() stream.Offset { return currentOffset },
+	}
+
+	go func() {
+		defer close(msgCh)
+		defer cancel()
+
+		for {
+			select {
+			case <-ctx.Done():
+				subscriptionErr = ctx.Err()
+				return
+			default:
+			}
+
+			result, err := c.readLongPoll(ctx, currentOffset)
+			if err != nil {
+				subscriptionErr = err
+				return
+			}
+
+			// Update offset even if no messages (204 No Content)
+			if result.Offset != "" {
+				currentOffset = result.Offset
+			}
+
+			// Only send if there are messages
+			if len(result.Messages) > 0 {
+				select {
+				case msgCh <- result:
+				case <-ctx.Done():
+					subscriptionErr = ctx.Err()
+					return
+				}
+			}
+		}
+	}()
+
+	return sub
+}
+
+// readLongPoll performs a long-poll read request.
+func (c *Client) readLongPoll(ctx context.Context, offset stream.Offset) (*ReadResult, error) {
+	query := "?live=long-poll&offset=" + url.QueryEscape(string(offset))
+
+	req, err := c.newRequest(ctx, http.MethodGet, query, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("long-poll request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrStreamNotFound
+	}
+
+	// 204 No Content means timeout - no new messages
+	if resp.StatusCode == http.StatusNoContent {
+		return &ReadResult{
+			Offset:   stream.Offset(resp.Header.Get("Stream-Next-Offset")),
+			UpToDate: resp.Header.Get("Stream-Up-To-Date") == "true",
+		}, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("long-poll request failed: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	result := &ReadResult{
+		Offset:   stream.Offset(resp.Header.Get("Stream-Next-Offset")),
+		UpToDate: resp.Header.Get("Stream-Up-To-Date") == "true",
+	}
+
+	// Parse messages based on content type
+	contentType := resp.Header.Get("Content-Type")
+	if c.isJSONContentType(contentType) {
+		var items []json.RawMessage
+		if len(body) > 0 {
+			if err := json.Unmarshal(body, &items); err != nil {
+				return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+			}
+		}
+		for _, item := range items {
+			result.Messages = append(result.Messages, stream.Message{Data: item})
+		}
+	} else {
+		if len(body) > 0 {
+			result.Messages = append(result.Messages, stream.Message{Data: body})
+		}
+	}
+
+	return result, nil
+}
+
 // Errors
 var (
 	// ErrStreamExists is returned when trying to create a stream that already exists.

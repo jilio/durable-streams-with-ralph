@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/jilio/durable-streams-with-ralph/server"
 	"github.com/jilio/durable-streams-with-ralph/stream"
@@ -449,4 +450,171 @@ func TestClient_CustomHeaders(t *testing.T) {
 	if receivedAuth != "Bearer secret-token" {
 		t.Errorf("Authorization = %q, want %q", receivedAuth, "Bearer secret-token")
 	}
+}
+
+func TestClient_Subscribe(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := server.NewWithOptions(storage, "", 100*time.Millisecond) // Short timeout for tests
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create stream with initial data
+	storage.Create(ctx, stream.StreamConfig{
+		Path:        "/test/stream",
+		ContentType: "application/json",
+	})
+	str, _ := storage.Get(ctx, "/test/stream")
+	str.Append(ctx, []byte(`{"event":"initial"}`))
+
+	c := New(ts.URL + "/test/stream")
+
+	// Start subscription
+	subCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	sub := c.Subscribe(subCtx, SubscribeOptions{
+		Offset: stream.StartOffset,
+	})
+
+	// Read initial message
+	select {
+	case result := <-sub.Messages:
+		if len(result.Messages) != 1 {
+			t.Errorf("len(Messages) = %d, want 1", len(result.Messages))
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout waiting for initial message")
+	}
+
+	// Append new message while subscribed
+	str.Append(ctx, []byte(`{"event":"new"}`))
+
+	// Should receive new message
+	select {
+	case result := <-sub.Messages:
+		if len(result.Messages) != 1 {
+			t.Errorf("len(Messages) = %d, want 1", len(result.Messages))
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout waiting for new message")
+	}
+
+	// Cancel subscription
+	sub.Cancel()
+
+	// Channel should be closed
+	select {
+	case _, ok := <-sub.Messages:
+		if ok {
+			t.Error("Expected channel to be closed after cancel")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Error("Timeout waiting for channel to close")
+	}
+}
+
+func TestClient_SubscribeFromNow(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := server.NewWithOptions(storage, "", 100*time.Millisecond)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create stream with initial data
+	storage.Create(ctx, stream.StreamConfig{
+		Path:        "/test/stream",
+		ContentType: "application/json",
+	})
+	str, _ := storage.Get(ctx, "/test/stream")
+	str.Append(ctx, []byte(`{"event":"old"}`))
+
+	c := New(ts.URL + "/test/stream")
+
+	// Start subscription from "now" - should not get old message
+	subCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	sub := c.Subscribe(subCtx, SubscribeOptions{
+		Offset: stream.NowOffset,
+	})
+
+	// Append new message
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		str.Append(ctx, []byte(`{"event":"new"}`))
+	}()
+
+	// Should only receive new message, not old
+	select {
+	case result := <-sub.Messages:
+		if string(result.Messages[0].Data) == `{"event":"old"}` {
+			t.Error("Should not receive old message when subscribing from now")
+		}
+	case <-time.After(500 * time.Millisecond):
+		// Timeout is ok - might not receive in time
+	}
+
+	sub.Cancel()
+}
+
+func TestClient_SubscribeNotFound(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := server.New(storage)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := New(ts.URL + "/nonexistent")
+
+	sub := c.Subscribe(ctx, SubscribeOptions{})
+
+	// Should receive error
+	select {
+	case <-sub.Messages:
+	case <-time.After(1 * time.Second):
+	}
+
+	if sub.Err() != ErrStreamNotFound {
+		t.Errorf("Err() = %v, want ErrStreamNotFound", sub.Err())
+	}
+}
+
+func TestClient_SubscribeOffset(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := server.NewWithOptions(storage, "", 100*time.Millisecond)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create stream with data
+	storage.Create(ctx, stream.StreamConfig{
+		Path:        "/test/stream",
+		ContentType: "application/json",
+	})
+	str, _ := storage.Get(ctx, "/test/stream")
+	str.Append(ctx, []byte(`{"event":"test"}`))
+
+	c := New(ts.URL + "/test/stream")
+
+	subCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	sub := c.Subscribe(subCtx, SubscribeOptions{
+		Offset: stream.StartOffset,
+	})
+
+	// Get message
+	<-sub.Messages
+
+	// Offset should be updated
+	offset := sub.Offset()
+	if offset == "" || offset == stream.StartOffset {
+		t.Error("Offset should be updated after receiving message")
+	}
+
+	sub.Cancel()
 }
