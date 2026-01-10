@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -64,9 +65,33 @@ type StreamConfig struct {
 // DefaultContentType is the default MIME type for streams.
 const DefaultContentType = "application/octet-stream"
 
+// NormalizeContentType normalizes a content-type string for comparison.
+// It strips charset parameters and converts to lowercase.
+func NormalizeContentType(ct string) string {
+	if ct == "" {
+		return ""
+	}
+	// Split on semicolon to strip charset
+	parts := strings.SplitN(ct, ";", 2)
+	return strings.ToLower(strings.TrimSpace(parts[0]))
+}
+
 // Normalize fills in default values for the stream config.
 func (c *StreamConfig) Normalize() {
 	if c.ContentType == "" {
 		c.ContentType = DefaultContentType
 	}
+}
+
+// NormalizedContentType returns the normalized content type for comparison.
+func (c *StreamConfig) NormalizedContentType() string {
+	return NormalizeContentType(c.ContentType)
+}
+
+// ConfigMatches checks if two configs are compatible for idempotent PUT.
+// Returns true if they match (same normalized content-type, TTL, and ExpiresAt).
+func (c *StreamConfig) ConfigMatches(other *StreamConfig) bool {
+	return c.NormalizedContentType() == other.NormalizedContentType() &&
+		c.TTLSeconds == other.TTLSeconds &&
+		c.ExpiresAt == other.ExpiresAt
 }

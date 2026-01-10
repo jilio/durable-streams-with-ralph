@@ -1,5 +1,3 @@
-//go:build ignore
-
 // Command client demonstrates the durable-streams client library.
 // It can produce messages to a stream or consume messages from it.
 package main

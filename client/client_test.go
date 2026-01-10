@@ -154,10 +154,16 @@ func TestClient_CreateDuplicate(t *testing.T) {
 	// Create first time
 	c.Create(ctx, CreateOptions{ContentType: "application/json"})
 
-	// Create second time should fail
+	// Create second time with same config should succeed (idempotent)
 	err := c.Create(ctx, CreateOptions{ContentType: "application/json"})
+	if err != nil {
+		t.Errorf("Create() with same config should be idempotent, got error = %v", err)
+	}
+
+	// Create with different config should fail
+	err = c.Create(ctx, CreateOptions{ContentType: "text/plain"})
 	if err != ErrStreamExists {
-		t.Errorf("Create() error = %v, want ErrStreamExists", err)
+		t.Errorf("Create() with different config error = %v, want ErrStreamExists", err)
 	}
 }
 

@@ -1,5 +1,3 @@
-//go:build ignore
-
 // Command server runs the durable-streams HTTP server.
 package main
 

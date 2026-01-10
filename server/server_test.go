@@ -72,16 +72,25 @@ func TestServer_PutIdempotentCreate(t *testing.T) {
 		t.Fatalf("First create StatusCode = %d, want %d", w1.Result().StatusCode, http.StatusCreated)
 	}
 
-	// Second create (idempotent) - should return 409 Conflict per our current impl
-	// Note: Reference impl returns 200 for matching config, 409 for different config
+	// Second create with same config (idempotent) - should return 200 OK
 	req2 := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
 	req2.Header.Set("Content-Type", "application/json")
 	w2 := httptest.NewRecorder()
 	srv.ServeHTTP(w2, req2)
 
-	// For now, we return 409 Conflict for existing stream
-	if w2.Result().StatusCode != http.StatusConflict {
-		t.Errorf("Second create StatusCode = %d, want %d", w2.Result().StatusCode, http.StatusConflict)
+	// Idempotent PUT with matching config returns 200 OK
+	if w2.Result().StatusCode != http.StatusOK {
+		t.Errorf("Second create (same config) StatusCode = %d, want %d", w2.Result().StatusCode, http.StatusOK)
+	}
+
+	// Third create with different config - should return 409 Conflict
+	req3 := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	req3.Header.Set("Content-Type", "text/plain")
+	w3 := httptest.NewRecorder()
+	srv.ServeHTTP(w3, req3)
+
+	if w3.Result().StatusCode != http.StatusConflict {
+		t.Errorf("Third create (different config) StatusCode = %d, want %d", w3.Result().StatusCode, http.StatusConflict)
 	}
 }
 
@@ -313,8 +322,8 @@ func TestServer_PostAppend(t *testing.T) {
 	srv.ServeHTTP(w, req)
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
 
 	// Check Stream-Next-Offset header

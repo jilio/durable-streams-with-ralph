@@ -34,15 +34,38 @@ func NewMemoryStorage() *MemoryStorage {
 	}
 }
 
+// CreateResult indicates what happened during stream creation.
+type CreateResult struct {
+	// Created is true if the stream was newly created.
+	Created bool
+	// Matched is true if stream existed with matching config (idempotent success).
+	Matched bool
+}
+
 // Create creates a new stream with the given configuration.
+// For idempotent PUT: returns ErrStreamExists if stream exists with matching config (for 200 response).
+// Returns ErrConfigMismatch if stream exists with different config (for 409).
+// Returns nil if a new stream was created (for 201).
 func (s *MemoryStorage) Create(ctx context.Context, config StreamConfig) error {
 	config.Normalize()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.streams[config.Path]; exists {
-		return ErrStreamExists
+	if existing, exists := s.streams[config.Path]; exists {
+		// Check if stream has expired
+		if s.isExpired(existing) {
+			// Expired stream - delete it and allow recreation
+			delete(s.streams, config.Path)
+		} else {
+			// Stream exists - check for idempotent match
+			if config.ConfigMatches(&existing.config) {
+				// Config matches - idempotent success (return ErrStreamExists for 200)
+				return ErrStreamExists
+			}
+			// Config mismatch - conflict (409)
+			return ErrConfigMismatch
+		}
 	}
 
 	s.streams[config.Path] = &memoryStreamData{
@@ -52,16 +75,81 @@ func (s *MemoryStorage) Create(ctx context.Context, config StreamConfig) error {
 		createdAt: time.Now().UnixMilli(),
 	}
 
-	return nil
+	return nil // New stream created
+}
+
+// CreateOrMatch creates a stream or returns match status for idempotent PUT.
+// Returns (true, nil) for new stream, (false, nil) for matched config,
+// (false, ErrConfigMismatch) for config mismatch.
+func (s *MemoryStorage) CreateOrMatch(ctx context.Context, config StreamConfig) (created bool, err error) {
+	config.Normalize()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, exists := s.streams[config.Path]; exists {
+		// Check if stream has expired
+		if s.isExpired(existing) {
+			// Expired stream - delete it and allow recreation
+			delete(s.streams, config.Path)
+		} else {
+			// Stream exists - check for idempotent match
+			if config.ConfigMatches(&existing.config) {
+				// Config matches - idempotent success (200)
+				return false, nil
+			}
+			// Config mismatch - conflict (409)
+			return false, ErrConfigMismatch
+		}
+	}
+
+	s.streams[config.Path] = &memoryStreamData{
+		config:    config,
+		messages:  make([]Message, 0),
+		offsetGen: NewOffsetGenerator(),
+		createdAt: time.Now().UnixMilli(),
+	}
+
+	return true, nil
+}
+
+// isExpired checks if a stream has expired based on TTL or ExpiresAt.
+func (s *MemoryStorage) isExpired(data *memoryStreamData) bool {
+	now := time.Now()
+
+	// Check TTL
+	if data.config.TTLSeconds > 0 {
+		createdTime := time.UnixMilli(data.createdAt)
+		expiresAt := createdTime.Add(time.Duration(data.config.TTLSeconds) * time.Second)
+		if now.After(expiresAt) {
+			return true
+		}
+	}
+
+	// Check ExpiresAt
+	if data.config.ExpiresAt != "" {
+		expiresAt, err := time.Parse(time.RFC3339, data.config.ExpiresAt)
+		if err == nil && now.After(expiresAt) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Get returns a Stream handle for the given path.
 func (s *MemoryStorage) Get(ctx context.Context, path string) (Stream, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	data, exists := s.streams[path]
 	if !exists {
+		return nil, ErrStreamNotFound
+	}
+
+	// Check if stream has expired
+	if s.isExpired(data) {
+		delete(s.streams, path)
 		return nil, ErrStreamNotFound
 	}
 
@@ -83,22 +171,39 @@ func (s *MemoryStorage) Delete(ctx context.Context, path string) error {
 
 // Exists checks if a stream exists at the given path.
 func (s *MemoryStorage) Exists(ctx context.Context, path string) (bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	_, exists := s.streams[path]
-	return exists, nil
+	data, exists := s.streams[path]
+	if !exists {
+		return false, nil
+	}
+
+	// Check if stream has expired
+	if s.isExpired(data) {
+		delete(s.streams, path)
+		return false, nil
+	}
+
+	return true, nil
 }
 
 // Head returns metadata about a stream without reading its content.
 func (s *MemoryStorage) Head(ctx context.Context, path string) (*StreamMetadata, error) {
-	s.mu.RLock()
+	s.mu.Lock()
 	data, exists := s.streams[path]
-	s.mu.RUnlock()
-
 	if !exists {
+		s.mu.Unlock()
 		return nil, ErrStreamNotFound
 	}
+
+	// Check if stream has expired
+	if s.isExpired(data) {
+		delete(s.streams, path)
+		s.mu.Unlock()
+		return nil, ErrStreamNotFound
+	}
+	s.mu.Unlock()
 
 	data.mu.RLock()
 	defer data.mu.RUnlock()

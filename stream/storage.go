@@ -27,6 +27,12 @@ var (
 	// ErrSeqConflict is returned when a sequence number conflicts with
 	// an existing sequence (for writer coordination).
 	ErrSeqConflict = errors.New("sequence conflict")
+
+	// ErrConfigMismatch is returned for idempotent PUT when config differs from existing stream.
+	ErrConfigMismatch = errors.New("stream config mismatch")
+
+	// ErrStreamExpired is returned when the stream has expired (TTL or ExpiresAt).
+	ErrStreamExpired = errors.New("stream has expired")
 )
 
 // StreamStorage defines the interface for stream storage backends.

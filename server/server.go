@@ -65,6 +65,9 @@ func NewWithOptions(storage stream.StreamStorage, baseURL string, longPollTimeou
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Set security headers on all responses
+	s.setSecurityHeaders(w)
+
 	path := r.URL.Path
 
 	switch r.Method {
@@ -84,6 +87,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderAllow, "GET, POST, PUT, DELETE, HEAD, OPTIONS")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// setSecurityHeaders sets browser security headers on responses.
+func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Stream-TTL, Stream-Expires-At, Stream-Seq, If-None-Match, Accept")
+	w.Header().Set("Access-Control-Expose-Headers", "Stream-Next-Offset, Stream-Up-To-Date, Stream-Cursor, Stream-TTL, Stream-Expires-At, ETag, Location, Content-Type")
 }
 
 // handleCreate handles PUT requests to create a new stream.
@@ -146,8 +159,22 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 	// Create the stream
 	err = s.storage.Create(ctx, config)
 	if err == stream.ErrStreamExists {
-		// Stream already exists - return 409 Conflict
-		http.Error(w, "Stream already exists", http.StatusConflict)
+		// Stream already exists with matching config - idempotent success (200)
+		// Get the current offset
+		var existingOffset stream.Offset = stream.InitialOffset
+		meta, metaErr := s.storage.Head(ctx, path)
+		if metaErr == nil {
+			existingOffset = meta.NextOffset
+		}
+		w.Header().Set(HeaderContentType, contentType)
+		w.Header().Set(HeaderStreamOffset, string(existingOffset))
+		w.Header().Set(HeaderLocation, s.baseURL+path)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if err == stream.ErrConfigMismatch {
+		// Stream exists with different config - conflict (409)
+		http.Error(w, "Stream already exists with different configuration", http.StatusConflict)
 		return
 	}
 	if err != nil {
@@ -214,6 +241,14 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 
+	// Verify content-type matches stream's content-type (case-insensitive)
+	streamContentType := stream.NormalizeContentType(str.ContentType())
+	requestContentType := stream.NormalizeContentType(contentType)
+	if streamContentType != requestContentType {
+		http.Error(w, "Content-Type mismatch", http.StatusConflict)
+		return
+	}
+
 	// Append the data
 	nextOffset, err := str.Append(ctx, body)
 	if err != nil {
@@ -223,7 +258,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 
 	// Set response headers
 	w.Header().Set(HeaderStreamOffset, string(nextOffset))
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleDelete handles DELETE requests to remove a stream.

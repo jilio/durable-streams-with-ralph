@@ -184,7 +184,8 @@ func (c *Client) Create(ctx context.Context, opts CreateOptions) error {
 		return ErrStreamExists
 	}
 
-	if resp.StatusCode != http.StatusCreated {
+	// 201 = newly created, 200 = idempotent match
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("create request failed: %s", resp.Status)
 	}
 
@@ -251,7 +252,8 @@ func (c *Client) Append(ctx context.Context, data []byte) (stream.Offset, error)
 		return "", ErrStreamNotFound
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	// Accept both 200 and 204 as success (204 is standard, 200 for producer mode)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return "", fmt.Errorf("append request failed: %s", resp.Status)
 	}
 
