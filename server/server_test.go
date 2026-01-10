@@ -766,3 +766,90 @@ func TestServer_GetLongPollOffsetNow(t *testing.T) {
 		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
 }
+
+// SSE tests
+
+func TestServer_GetSSERequiresOffset(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// SSE without offset should fail
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?live=sse", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestServer_GetSSEHeaders(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := NewWithOptions(storage, "", 50*time.Millisecond)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// SSE request
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?live=sse&offset=-1", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// Check SSE headers
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want %q", ct, "text/event-stream")
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "no-cache")
+	}
+	if conn := resp.Header.Get("Connection"); conn != "keep-alive" {
+		t.Errorf("Connection = %q, want %q", conn, "keep-alive")
+	}
+}
+
+func TestServer_GetSSEWithData(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := NewWithOptions(storage, "", 50*time.Millisecond)
+
+	// Create stream with data
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", strings.NewReader(`{"event":"test"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// SSE request
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?live=sse&offset=-1", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	// Should have data event
+	if !strings.Contains(string(body), "event: data") {
+		t.Errorf("Body missing 'event: data': %q", body)
+	}
+	// Should have the message payload
+	if !strings.Contains(string(body), `{"event":"test"}`) {
+		t.Errorf("Body missing message payload: %q", body)
+	}
+	// Should have control event
+	if !strings.Contains(string(body), "event: control") {
+		t.Errorf("Body missing 'event: control': %q", body)
+	}
+}
