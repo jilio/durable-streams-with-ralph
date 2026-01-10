@@ -120,6 +120,18 @@ Depends on Epic 6.
 - ifi: Pass all 195 conformance tests
 - oiy: Match reference server benchmarks
 
+### Epic 8: Redis Storage (3my)
+Depends on Epic 7.
+- 3my.1: Design Redis storage schema
+- 3my.2: Implement RedisStorage interface
+- 3my.3: Implement Redis Streams XADD/XREAD
+- 3my.4: Implement command pipelining
+- 3my.5: Implement Redis long-poll with XREAD BLOCK
+- 3my.6: Add Redis connection pooling
+- 3my.7: Profile Redis implementation (pprof)
+- 3my.8: Benchmark Redis vs Memory storage
+- 3my.9: Add Redis integration tests
+
 ---
 
 ## Conformance Testing
@@ -161,12 +173,13 @@ Go server should match or exceed reference server performance.
 ## Completion Criteria
 
 The loop stops when ALL of the following are true:
-- All 7 epics closed
+- All 8 epics closed
 - `bd ready` shows "No open issues"
 - `go test ./...` passes with exit code 0
 - Test coverage >= 80%
 - All 195 conformance tests pass
 - Benchmarks match or exceed reference server
+- Redis storage implemented with proper profiling
 - Example server and client run successfully
 
 When ALL criteria are met, output exactly:

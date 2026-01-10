@@ -64,6 +64,21 @@ bun run benchmark:reference
 1. **Unit tests**: All Go code must have >= 80% test coverage
 2. **Conformance tests**: Go server must pass all 195 official conformance tests
 3. **Benchmarks**: Go server should match or exceed reference server performance
+4. **Redis tests**: Use testcontainers or local Redis for integration tests
+
+## Redis Storage Implementation
+
+Redis storage uses Redis Streams for optimal performance:
+- **XADD**: Append messages to stream
+- **XREAD**: Read messages from offset (stream ID)
+- **XREAD BLOCK**: Long-polling without busy waiting
+- **Pipeline**: Batch multiple commands for lower latency
+
+Performance requirements:
+- Use connection pooling for high concurrency
+- Pipeline commands when possible (MULTI/EXEC or Pipeline())
+- Profile with pprof to identify bottlenecks
+- Benchmark against MemoryStorage for comparison
 
 ## TDD Workflow
 
