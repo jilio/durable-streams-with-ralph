@@ -74,6 +74,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleCreate(w, r, path)
 	case http.MethodPost:
 		s.handleAppend(w, r, path)
+	case http.MethodDelete:
+		s.handleDelete(w, r, path)
 	case http.MethodOptions:
 		s.handleOptions(w, r)
 	default:
@@ -220,6 +222,31 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 	// Set response headers
 	w.Header().Set(HeaderStreamOffset, string(nextOffset))
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleDelete handles DELETE requests to remove a stream.
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path string) {
+	ctx := r.Context()
+
+	// Check if stream exists
+	exists, err := s.storage.Exists(ctx, path)
+	if err != nil {
+		http.Error(w, "Failed to check stream", http.StatusInternalServerError)
+		return
+	}
+	if !exists {
+		http.Error(w, "Stream not found", http.StatusNotFound)
+		return
+	}
+
+	// Delete the stream
+	err = s.storage.Delete(ctx, path)
+	if err != nil {
+		http.Error(w, "Failed to delete stream", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleRead handles GET requests to read from a stream.

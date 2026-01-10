@@ -853,3 +853,49 @@ func TestServer_GetSSEWithData(t *testing.T) {
 		t.Errorf("Body missing 'event: control': %q", body)
 	}
 }
+
+// DELETE tests
+
+func TestServer_DeleteStream(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Delete stream
+	req := httptest.NewRequest(http.MethodDelete, "/test/stream", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	// Verify stream no longer exists
+	getReq := httptest.NewRequest(http.MethodGet, "/test/stream", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, getReq)
+
+	if w.Result().StatusCode != http.StatusNotFound {
+		t.Errorf("Stream still exists after delete, got status %d", w.Result().StatusCode)
+	}
+}
+
+func TestServer_DeleteStreamNotFound(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	req := httptest.NewRequest(http.MethodDelete, "/nonexistent/stream", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
