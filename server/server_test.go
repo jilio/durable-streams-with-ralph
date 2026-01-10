@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jilio/durable-streams-with-ralph/stream"
 )
@@ -663,5 +664,105 @@ func TestServer_GetReadNoOffsetParam(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), `{"event":"test"}`) {
 		t.Errorf("Body missing event: %q", body)
+	}
+}
+
+// Long-poll tests
+
+func TestServer_GetLongPollRequiresOffset(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Long-poll without offset should fail
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?live=long-poll", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestServer_GetLongPollTimeout(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := NewWithOptions(storage, "", 50*time.Millisecond) // Short timeout for test
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Long-poll on empty stream should timeout with 204
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?live=long-poll&offset=-1", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("StatusCode = %d, want %d (204 No Content)", resp.StatusCode, http.StatusNoContent)
+	}
+
+	// Should have offset and up-to-date headers
+	if offset := resp.Header.Get("Stream-Next-Offset"); offset == "" {
+		t.Error("Stream-Next-Offset header missing")
+	}
+	if upToDate := resp.Header.Get("Stream-Up-To-Date"); upToDate != "true" {
+		t.Errorf("Stream-Up-To-Date = %q, want %q", upToDate, "true")
+	}
+}
+
+func TestServer_GetLongPollWithData(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := NewWithOptions(storage, "", 1*time.Second)
+
+	// Create stream with data
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", strings.NewReader(`{"event":"initial"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Long-poll from start should return existing data immediately
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?live=long-poll&offset=-1", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `{"event":"initial"}`) {
+		t.Errorf("Body missing event: %q", body)
+	}
+}
+
+func TestServer_GetLongPollOffsetNow(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := NewWithOptions(storage, "", 50*time.Millisecond)
+
+	// Create stream with data
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", strings.NewReader(`{"event":"initial"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Long-poll with offset=now should wait then timeout
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?live=long-poll&offset=now", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	// Should timeout with 204 since no new messages after "now"
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
 }

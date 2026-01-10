@@ -104,6 +104,20 @@ func (w *mockStorageStreamWrapper) ReadFrom(ctx context.Context, offset Offset) 
 	return NewBatch(msgs, w.s.offset), nil
 }
 
+func (w *mockStorageStreamWrapper) WaitForMessages(ctx context.Context, offset Offset, timeout time.Duration) WaitResult {
+	// Simple mock implementation - just check for existing messages
+	var msgs []Message
+	for _, msg := range w.s.messages {
+		if offset.IsStart() || msg.Offset.Compare(offset) > 0 {
+			msgs = append(msgs, msg)
+		}
+	}
+	if len(msgs) > 0 {
+		return WaitResult{Messages: msgs, TimedOut: false}
+	}
+	return WaitResult{TimedOut: true}
+}
+
 // TestStreamStorageInterface verifies that mockStorage implements StreamStorage
 func TestStreamStorageInterface(t *testing.T) {
 	var _ StreamStorage = (*mockStorage)(nil)

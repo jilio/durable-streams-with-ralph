@@ -53,6 +53,20 @@ func (m *mockStream) ReadFrom(ctx context.Context, offset Offset) (Batch, error)
 	return NewBatch(msgs, m.currentOffset), nil
 }
 
+func (m *mockStream) WaitForMessages(ctx context.Context, offset Offset, timeout time.Duration) WaitResult {
+	// Simple mock implementation - just check for existing messages
+	var msgs []Message
+	for _, msg := range m.messages {
+		if offset.IsStart() || msg.Offset.Compare(offset) > 0 {
+			msgs = append(msgs, msg)
+		}
+	}
+	if len(msgs) > 0 {
+		return WaitResult{Messages: msgs, TimedOut: false}
+	}
+	return WaitResult{TimedOut: true}
+}
+
 // TestStreamInterface verifies that our mock implements Stream
 func TestStreamInterface(t *testing.T) {
 	var _ Stream = (*mockStream)(nil)

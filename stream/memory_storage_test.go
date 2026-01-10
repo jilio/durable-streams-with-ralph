@@ -319,3 +319,89 @@ func TestMemoryStorage_CreatedAt(t *testing.T) {
 		t.Errorf("CreatedAt = %d, want between %d and %d", meta.CreatedAt, before, after)
 	}
 }
+
+func TestMemoryStorage_WaitForMessagesTimeout(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+
+	config := StreamConfig{
+		Path:        "/test/stream",
+		ContentType: "application/octet-stream",
+	}
+	storage.Create(ctx, config)
+
+	stream, _ := storage.Get(ctx, "/test/stream")
+
+	// Wait with a short timeout - should time out since no messages
+	result := stream.WaitForMessages(ctx, StartOffset, 50*time.Millisecond)
+	if !result.TimedOut {
+		t.Error("WaitForMessages should time out on empty stream")
+	}
+	if len(result.Messages) != 0 {
+		t.Errorf("Messages = %d, want 0", len(result.Messages))
+	}
+}
+
+func TestMemoryStorage_WaitForMessagesWithData(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+
+	config := StreamConfig{
+		Path:        "/test/stream",
+		ContentType: "application/octet-stream",
+	}
+	storage.Create(ctx, config)
+
+	stream, _ := storage.Get(ctx, "/test/stream")
+
+	// Append data before waiting
+	stream.Append(ctx, []byte("hello"))
+
+	// Wait should return immediately with the message
+	result := stream.WaitForMessages(ctx, StartOffset, 1*time.Second)
+	if result.TimedOut {
+		t.Error("WaitForMessages should not time out with existing messages")
+	}
+	if len(result.Messages) != 1 {
+		t.Errorf("Messages = %d, want 1", len(result.Messages))
+	}
+}
+
+func TestMemoryStorage_WaitForMessagesConcurrent(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+
+	config := StreamConfig{
+		Path:        "/test/stream",
+		ContentType: "application/octet-stream",
+	}
+	storage.Create(ctx, config)
+
+	stream, _ := storage.Get(ctx, "/test/stream")
+	currentOffset := stream.CurrentOffset()
+
+	// Start waiting in goroutine
+	done := make(chan WaitResult)
+	go func() {
+		done <- stream.WaitForMessages(ctx, currentOffset, 1*time.Second)
+	}()
+
+	// Give the wait time to start polling
+	time.Sleep(20 * time.Millisecond)
+
+	// Append data
+	stream.Append(ctx, []byte("hello"))
+
+	// Should receive the message
+	select {
+	case result := <-done:
+		if result.TimedOut {
+			t.Error("WaitForMessages should not time out")
+		}
+		if len(result.Messages) != 1 {
+			t.Errorf("Messages = %d, want 1", len(result.Messages))
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("WaitForMessages did not return in time")
+	}
+}

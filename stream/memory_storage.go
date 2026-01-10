@@ -163,6 +163,41 @@ func (m *memoryStream) ReadFrom(ctx context.Context, offset Offset) (Batch, erro
 	return NewBatch(msgs, m.data.offsetGen.Current()), nil
 }
 
+// WaitForMessages blocks until new messages are available or timeout expires.
+func (m *memoryStream) WaitForMessages(ctx context.Context, offset Offset, timeout time.Duration) WaitResult {
+	deadline := time.Now().Add(timeout)
+	pollInterval := 10 * time.Millisecond
+
+	for {
+		// Check for new messages
+		m.data.mu.RLock()
+		var msgs []Message
+		for _, msg := range m.data.messages {
+			if offset.IsStart() || msg.Offset.Compare(offset) > 0 {
+				msgs = append(msgs, msg)
+			}
+		}
+		m.data.mu.RUnlock()
+
+		if len(msgs) > 0 {
+			return WaitResult{Messages: msgs, TimedOut: false}
+		}
+
+		// Check timeout
+		if time.Now().After(deadline) {
+			return WaitResult{TimedOut: true}
+		}
+
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return WaitResult{TimedOut: true}
+		case <-time.After(pollInterval):
+			// Continue polling
+		}
+	}
+}
+
 // Ensure interfaces are implemented
 var (
 	_ StreamStorage = (*MemoryStorage)(nil)

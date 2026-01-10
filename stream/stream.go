@@ -1,6 +1,9 @@
 package stream
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Stream defines the interface for a durable stream.
 // Implementations handle the actual storage and retrieval of messages.
@@ -25,6 +28,19 @@ type Stream interface {
 	// Returns a Batch containing zero or more messages.
 	// The batch's NextOffset should be used for subsequent reads.
 	ReadFrom(ctx context.Context, offset Offset) (Batch, error)
+
+	// WaitForMessages blocks until new messages are available after the given offset,
+	// or until the timeout expires. Returns WaitResult indicating what happened.
+	WaitForMessages(ctx context.Context, offset Offset, timeout time.Duration) WaitResult
+}
+
+// WaitResult represents the result of a WaitForMessages call.
+type WaitResult struct {
+	// Messages contains any new messages received.
+	Messages []Message
+
+	// TimedOut is true if the wait timed out without receiving messages.
+	TimedOut bool
 }
 
 // StreamConfig holds configuration for creating a new stream.

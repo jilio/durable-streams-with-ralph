@@ -25,25 +25,40 @@ const (
 	HeaderAllow          = "Allow"
 )
 
+// DefaultLongPollTimeout is the default timeout for long-poll requests.
+const DefaultLongPollTimeout = 30 * time.Second
+
 // Server is an HTTP server for the durable streams protocol.
 type Server struct {
-	storage stream.StreamStorage
-	baseURL string
+	storage         stream.StreamStorage
+	baseURL         string
+	longPollTimeout time.Duration
 }
 
 // New creates a new durable streams server with the given storage backend.
 func New(storage stream.StreamStorage) *Server {
 	return &Server{
-		storage: storage,
-		baseURL: "",
+		storage:         storage,
+		baseURL:         "",
+		longPollTimeout: DefaultLongPollTimeout,
 	}
 }
 
 // NewWithBaseURL creates a new server with a custom base URL for Location headers.
 func NewWithBaseURL(storage stream.StreamStorage, baseURL string) *Server {
 	return &Server{
-		storage: storage,
-		baseURL: baseURL,
+		storage:         storage,
+		baseURL:         baseURL,
+		longPollTimeout: DefaultLongPollTimeout,
+	}
+}
+
+// NewWithOptions creates a new server with custom options.
+func NewWithOptions(storage stream.StreamStorage, baseURL string, longPollTimeout time.Duration) *Server {
+	return &Server{
+		storage:         storage,
+		baseURL:         baseURL,
+		longPollTimeout: longPollTimeout,
 	}
 }
 
@@ -216,8 +231,9 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 
-	// Get offset from query parameter
+	// Get query parameters
 	offset := r.URL.Query().Get("offset")
+	live := r.URL.Query().Get("live")
 
 	// Check if offset parameter was provided but empty
 	if r.URL.Query().Has("offset") && offset == "" {
@@ -234,8 +250,14 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		}
 	}
 
-	// Handle offset=now (return current tail offset with empty response)
-	if offset == "now" {
+	// Long-poll requires offset parameter
+	if live == "long-poll" && offset == "" {
+		http.Error(w, "Long-poll requires offset parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Handle offset=now without long-poll (return current tail offset)
+	if offset == "now" && live != "long-poll" {
 		currentOffset := str.CurrentOffset()
 		w.Header().Set(HeaderContentType, str.ContentType())
 		w.Header().Set(HeaderStreamOffset, string(currentOffset))
@@ -243,24 +265,41 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 
-		// For JSON content type, return empty array
 		if isJSONContentType(str.ContentType()) {
 			w.Write([]byte("[]"))
 		}
 		return
 	}
 
-	// Default offset is StartOffset (-1) if not provided
-	readOffset := stream.StartOffset
-	if offset != "" && offset != "-1" {
-		readOffset = stream.Offset(offset)
+	// Convert offset to effective offset (handle "now")
+	effectiveOffset := stream.StartOffset
+	if offset == "now" {
+		effectiveOffset = str.CurrentOffset()
+	} else if offset != "" && offset != "-1" {
+		effectiveOffset = stream.Offset(offset)
 	}
 
 	// Read messages from the stream
-	batch, err := str.ReadFrom(ctx, readOffset)
+	batch, err := str.ReadFrom(ctx, effectiveOffset)
 	if err != nil {
 		http.Error(w, "Failed to read stream", http.StatusInternalServerError)
 		return
+	}
+
+	// Long-poll: wait for new messages if caught up
+	if live == "long-poll" && batch.Len() == 0 {
+		result := str.WaitForMessages(ctx, effectiveOffset, s.longPollTimeout)
+
+		if result.TimedOut {
+			// Return 204 No Content on timeout
+			w.Header().Set(HeaderStreamOffset, string(str.CurrentOffset()))
+			w.Header().Set(HeaderStreamUpToDate, "true")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// Got new messages
+		batch = stream.NewBatch(result.Messages, str.CurrentOffset())
 	}
 
 	// Build response
