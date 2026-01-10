@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,10 +26,32 @@ const (
 	HeaderStreamSeq      = "Stream-Seq"
 	HeaderLocation       = "Location"
 	HeaderAllow          = "Allow"
+
+	// Producer headers for idempotent writes
+	HeaderProducerId          = "Producer-Id"
+	HeaderProducerEpoch       = "Producer-Epoch"
+	HeaderProducerSeq         = "Producer-Seq"
+	HeaderProducerExpectedSeq = "Producer-Expected-Seq"
+	HeaderProducerReceivedSeq = "Producer-Received-Seq"
 )
 
 // DefaultLongPollTimeout is the default timeout for long-poll requests.
 const DefaultLongPollTimeout = 30 * time.Second
+
+// Cursor constants for CDN cache collapsing
+const (
+	// CursorEpoch is the reference point for cursor calculation (October 9, 2024 UTC)
+	CursorEpoch = 1728432000000 // milliseconds since Unix epoch
+
+	// CursorIntervalSeconds is the interval duration for cursor calculation
+	CursorIntervalSeconds = 20
+
+	// MaxJitterSeconds is the maximum jitter to add on cursor collision
+	MaxJitterSeconds = 3600
+
+	// MinJitterSeconds is the minimum jitter to add
+	MinJitterSeconds = 1
+)
 
 // Server is an HTTP server for the durable streams protocol.
 type Server struct {
@@ -90,14 +113,38 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// getAbsoluteURL constructs an absolute URL for the given path using the request.
+func (s *Server) getAbsoluteURL(r *http.Request, path string) string {
+	if s.baseURL != "" {
+		return s.baseURL + path
+	}
+
+	// Construct URL from request
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	// Check X-Forwarded-Proto header
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+
+	host := r.Host
+	if host == "" {
+		host = "localhost"
+	}
+
+	return scheme + "://" + host + path
+}
+
 // setSecurityHeaders sets browser security headers on responses.
 func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Stream-TTL, Stream-Expires-At, Stream-Seq, If-None-Match, Accept")
-	w.Header().Set("Access-Control-Expose-Headers", "Stream-Next-Offset, Stream-Up-To-Date, Stream-Cursor, Stream-TTL, Stream-Expires-At, ETag, Location, Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Stream-TTL, Stream-Expires-At, Stream-Seq, If-None-Match, Accept, Producer-Id, Producer-Epoch, Producer-Seq")
+	w.Header().Set("Access-Control-Expose-Headers", "Stream-Next-Offset, Stream-Up-To-Date, Stream-Cursor, Stream-TTL, Stream-Expires-At, ETag, Location, Content-Type, Producer-Epoch, Producer-Seq, Producer-Expected-Seq, Producer-Received-Seq")
 }
 
 // handleCreate handles PUT requests to create a new stream.
@@ -169,7 +216,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 		}
 		w.Header().Set(HeaderContentType, contentType)
 		w.Header().Set(HeaderStreamOffset, string(existingOffset))
-		w.Header().Set(HeaderLocation, s.baseURL+path)
+		w.Header().Set(HeaderLocation, s.getAbsoluteURL(r, path))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -191,13 +238,34 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 			http.Error(w, "Failed to get stream", http.StatusInternalServerError)
 			return
 		}
-		nextOffset, err = str.Append(ctx, body)
-		if err != nil {
-			http.Error(w, "Failed to append initial data", http.StatusInternalServerError)
-			return
+
+		// For JSON mode, handle initial data specially
+		if isJSONContentType(contentType) {
+			messages, jsonErr := processJSONAppendForPUT(body)
+			if jsonErr != nil {
+				http.Error(w, jsonErr.Error(), http.StatusBadRequest)
+				return
+			}
+			// Only append if there are actual messages (empty array = no messages)
+			for _, msg := range messages {
+				nextOffset, err = str.Append(ctx, msg)
+				if err != nil {
+					http.Error(w, "Failed to append initial data", http.StatusInternalServerError)
+					return
+				}
+			}
+		} else {
+			// Binary mode
+			nextOffset, err = str.Append(ctx, body)
+			if err != nil {
+				http.Error(w, "Failed to append initial data", http.StatusInternalServerError)
+				return
+			}
 		}
-	} else {
-		// Get the current offset
+	}
+
+	// Get the current offset if we haven't set it yet
+	if nextOffset == stream.InitialOffset {
 		meta, err := s.storage.Head(ctx, path)
 		if err == nil {
 			nextOffset = meta.NextOffset
@@ -207,7 +275,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 	// Set response headers
 	w.Header().Set(HeaderContentType, contentType)
 	w.Header().Set(HeaderStreamOffset, string(nextOffset))
-	w.Header().Set(HeaderLocation, s.baseURL+path)
+	w.Header().Set(HeaderLocation, s.getAbsoluteURL(r, path))
 
 	w.WriteHeader(http.StatusCreated)
 }
@@ -250,6 +318,45 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 
+	// Get Stream-Seq header for ordering enforcement
+	seq := r.Header.Get(HeaderStreamSeq)
+
+	// Extract producer headers
+	producerId := r.Header.Get(HeaderProducerId)
+	producerEpochStr := r.Header.Get(HeaderProducerEpoch)
+	producerSeqStr := r.Header.Get(HeaderProducerSeq)
+
+	// Validate producer headers - all three must be present together or none
+	hasProducerHeaders := producerId != "" || producerEpochStr != "" || producerSeqStr != ""
+	hasAllProducerHeaders := producerId != "" && producerEpochStr != "" && producerSeqStr != ""
+
+	if hasProducerHeaders && !hasAllProducerHeaders {
+		http.Error(w, "All producer headers (Producer-Id, Producer-Epoch, Producer-Seq) must be provided together", http.StatusBadRequest)
+		return
+	}
+
+	if hasAllProducerHeaders && producerId == "" {
+		http.Error(w, "Invalid Producer-Id: must not be empty", http.StatusBadRequest)
+		return
+	}
+
+	// Parse and validate producer epoch and seq as integers
+	var producerEpoch, producerSeq int64
+	if hasAllProducerHeaders {
+		var parseErr error
+		producerEpoch, parseErr = parseStrictInt64(producerEpochStr)
+		if parseErr != nil {
+			http.Error(w, "Invalid Producer-Epoch: must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+
+		producerSeq, parseErr = parseStrictInt64(producerSeqStr)
+		if parseErr != nil {
+			http.Error(w, "Invalid Producer-Seq: must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+	}
+
 	var nextOffset stream.Offset
 
 	// For JSON content-type, parse and handle array unwrapping
@@ -260,26 +367,211 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 
-		// Append each message
-		for _, msg := range messages {
-			nextOffset, err = str.Append(ctx, msg)
+		// With producer headers, treat the entire body as one batch
+		if hasAllProducerHeaders {
+			nextOffset, err = s.appendWithProducer(ctx, w, str, messages, producerId, producerEpoch, producerSeq)
+			if err != nil {
+				return // Error already handled
+			}
+		} else {
+			// No producer headers - append each message (only first uses seq)
+			for i, msg := range messages {
+				msgSeq := ""
+				if i == 0 && seq != "" {
+					msgSeq = seq
+				}
+				nextOffset, err = str.AppendWithSeq(ctx, msg, msgSeq)
+				if err == stream.ErrSeqConflict {
+					http.Error(w, "Sequence conflict", http.StatusConflict)
+					return
+				}
+				if err != nil {
+					http.Error(w, "Failed to append data", http.StatusInternalServerError)
+					return
+				}
+			}
+		}
+	} else {
+		// Binary mode
+		if hasAllProducerHeaders {
+			nextOffset, err = s.appendWithProducerBinary(ctx, w, str, body, producerId, producerEpoch, producerSeq)
+			if err != nil {
+				return // Error already handled
+			}
+		} else {
+			// No producer headers
+			nextOffset, err = str.AppendWithSeq(ctx, body, seq)
+			if err == stream.ErrSeqConflict {
+				http.Error(w, "Sequence conflict", http.StatusConflict)
+				return
+			}
 			if err != nil {
 				http.Error(w, "Failed to append data", http.StatusInternalServerError)
 				return
 			}
 		}
-	} else {
-		// Binary mode: append raw data
-		nextOffset, err = str.Append(ctx, body)
-		if err != nil {
-			http.Error(w, "Failed to append data", http.StatusInternalServerError)
-			return
-		}
 	}
 
 	// Set response headers
 	w.Header().Set(HeaderStreamOffset, string(nextOffset))
-	w.WriteHeader(http.StatusNoContent)
+
+	// Echo back producer headers on success (non-duplicate)
+	if hasAllProducerHeaders {
+		w.Header().Set(HeaderProducerEpoch, producerEpochStr)
+		w.Header().Set(HeaderProducerSeq, producerSeqStr)
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// appendWithProducer handles JSON mode append with producer headers.
+// Returns the offset and a non-nil error if the request was handled (success or error response).
+func (s *Server) appendWithProducer(ctx context.Context, w http.ResponseWriter, str stream.Stream, messages [][]byte, producerId string, epoch, seq int64) (stream.Offset, error) {
+	// Concatenate all messages for the batch
+	var batchData []byte
+	for _, msg := range messages {
+		batchData = append(batchData, msg...)
+	}
+
+	offset, result := str.AppendWithProducer(ctx, batchData, producerId, epoch, seq)
+	return s.handleProducerResult(w, offset, result, epoch, seq)
+}
+
+// appendWithProducerBinary handles binary mode append with producer headers.
+func (s *Server) appendWithProducerBinary(ctx context.Context, w http.ResponseWriter, str stream.Stream, data []byte, producerId string, epoch, seq int64) (stream.Offset, error) {
+	offset, result := str.AppendWithProducer(ctx, data, producerId, epoch, seq)
+	return s.handleProducerResult(w, offset, result, epoch, seq)
+}
+
+// handleProducerResult handles the response for producer append operations.
+func (s *Server) handleProducerResult(w http.ResponseWriter, offset stream.Offset, result *stream.ProducerResult, epoch, seq int64) (stream.Offset, error) {
+	switch result.Status {
+	case stream.ProducerStatusAccepted:
+		return offset, nil
+
+	case stream.ProducerStatusDuplicate:
+		// 204 No Content for duplicates (idempotent success)
+		// Return Producer-Seq as highest accepted (per PROTOCOL.md)
+		w.Header().Set(HeaderProducerEpoch, strconv.FormatInt(epoch, 10))
+		w.Header().Set(HeaderProducerSeq, strconv.FormatInt(result.LastSeq, 10))
+		w.WriteHeader(http.StatusNoContent)
+		return "", fmt.Errorf("duplicate")
+
+	case stream.ProducerStatusStaleEpoch:
+		// 403 Forbidden for stale epochs (zombie fencing)
+		w.Header().Set(HeaderProducerEpoch, strconv.FormatInt(result.CurrentEpoch, 10))
+		http.Error(w, "Stale producer epoch", http.StatusForbidden)
+		return "", fmt.Errorf("stale epoch")
+
+	case stream.ProducerStatusInvalidEpochSeq:
+		// 400 Bad Request for epoch increase with seq != 0
+		http.Error(w, "New epoch must start with sequence 0", http.StatusBadRequest)
+		return "", fmt.Errorf("invalid epoch seq")
+
+	case stream.ProducerStatusSequenceGap:
+		// 409 Conflict for sequence gaps
+		w.Header().Set(HeaderProducerExpectedSeq, strconv.FormatInt(result.ExpectedSeq, 10))
+		w.Header().Set(HeaderProducerReceivedSeq, strconv.FormatInt(result.ReceivedSeq, 10))
+		http.Error(w, "Producer sequence gap", http.StatusConflict)
+		return "", fmt.Errorf("sequence gap")
+	}
+
+	return offset, nil
+}
+
+// parseStrictInt64 parses a string as a strict non-negative integer.
+// Rejects values like "1abc", "1e3", "+1", "-1", "01" (leading zeros except "0").
+func parseStrictInt64(s string) (int64, error) {
+	// Must match: "0" or a number starting with 1-9
+	strictIntPattern := regexp.MustCompile(`^(0|[1-9]\d*)$`)
+	if !strictIntPattern.MatchString(s) {
+		return 0, strconv.ErrSyntax
+	}
+
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, strconv.ErrRange
+	}
+
+	return n, nil
+}
+
+// calculateCurrentCursor returns the current cursor value based on time intervals.
+func calculateCurrentCursor() int64 {
+	now := time.Now().UnixMilli()
+	intervalMs := int64(CursorIntervalSeconds * 1000)
+	return (now - CursorEpoch) / intervalMs
+}
+
+// generateETag creates an ETag for a GET response.
+// Format: "{base64(path)}:{startOffset}:{endOffset}"
+func generateETag(path string, startOffset string, endOffset stream.Offset) string {
+	pathEncoded := base64.StdEncoding.EncodeToString([]byte(path))
+	return fmt.Sprintf(`"%s:%s:%s"`, pathEncoded, startOffset, string(endOffset))
+}
+
+// generateResponseCursor generates a cursor for a response, ensuring monotonic progression.
+func generateResponseCursor(clientCursor string) string {
+	currentInterval := calculateCurrentCursor()
+
+	// No client cursor - return current interval
+	if clientCursor == "" {
+		return strconv.FormatInt(currentInterval, 10)
+	}
+
+	// Parse client cursor
+	clientInterval, err := strconv.ParseInt(clientCursor, 10, 64)
+	if err != nil || clientInterval < currentInterval {
+		// Invalid or behind current time - return current interval
+		return strconv.FormatInt(currentInterval, 10)
+	}
+
+	// Client cursor is at or ahead of current interval - add jitter
+	// Per protocol: add random 1-3600 seconds worth of intervals (minimum 1 interval)
+	jitterSeconds := MinJitterSeconds + int64(time.Now().UnixNano()%int64(MaxJitterSeconds-MinJitterSeconds+1))
+	// Convert to intervals, ensuring at least 1 interval is added
+	jitterIntervals := jitterSeconds/int64(CursorIntervalSeconds) + 1
+	return strconv.FormatInt(clientInterval+jitterIntervals, 10)
+}
+
+// processJSONAppendForPUT parses JSON body for PUT requests (initial data).
+// Unlike processJSONAppend, this allows empty arrays (they result in no messages).
+func processJSONAppendForPUT(body []byte) ([][]byte, error) {
+	// Parse JSON
+	var parsed interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("Invalid JSON")
+	}
+
+	// Check if it's an array
+	if arr, ok := parsed.([]interface{}); ok {
+		// Empty array is allowed for PUT - results in no messages
+		if len(arr) == 0 {
+			return [][]byte{}, nil
+		}
+
+		// Each element becomes a separate message with trailing comma
+		messages := make([][]byte, len(arr))
+		for i, item := range arr {
+			data, err := json.Marshal(item)
+			if err != nil {
+				return nil, fmt.Errorf("Invalid JSON")
+			}
+			messages[i] = append(data, ',')
+		}
+		return messages, nil
+	}
+
+	// Single value - store as single message with trailing comma
+	data, err := json.Marshal(parsed)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid JSON")
+	}
+	return [][]byte{append(data, ',')}, nil
 }
 
 // processJSONAppend parses JSON body and returns messages to append.
@@ -381,6 +673,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 	// Get query parameters
 	offset := r.URL.Query().Get("offset")
 	live := r.URL.Query().Get("live")
+	clientCursor := r.URL.Query().Get("cursor")
 
 	// Check if offset parameter was provided but empty
 	if r.URL.Query().Has("offset") && offset == "" {
@@ -411,7 +704,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		} else if offset == "-1" {
 			sseOffset = stream.StartOffset
 		}
-		s.handleSSE(ctx, w, str, sseOffset)
+		s.handleSSE(ctx, w, str, sseOffset, clientCursor)
 		return
 	}
 
@@ -453,6 +746,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 			// Return 204 No Content on timeout
 			w.Header().Set(HeaderStreamOffset, string(str.CurrentOffset()))
 			w.Header().Set(HeaderStreamUpToDate, "true")
+			w.Header().Set(HeaderStreamCursor, generateResponseCursor(clientCursor))
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -475,6 +769,29 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 	lastMsg, hasLast := batch.Last()
 	if !hasLast || lastMsg.Offset == str.CurrentOffset() {
 		w.Header().Set(HeaderStreamUpToDate, "true")
+	}
+
+	// Add cursor header for long-poll responses
+	if live == "long-poll" {
+		w.Header().Set(HeaderStreamCursor, generateResponseCursor(clientCursor))
+	}
+
+	// Generate ETag for non-live responses (not offset=now)
+	// ETag format: "{base64(path)}:{startOffset}:{endOffset}"
+	if live == "" && offset != "now" {
+		startOffset := offset
+		if startOffset == "" || startOffset == "-1" {
+			startOffset = "-1"
+		}
+		etag := generateETag(path, startOffset, responseOffset)
+		w.Header().Set("ETag", etag)
+
+		// Check If-None-Match for conditional GET
+		ifNoneMatch := r.Header.Get("If-None-Match")
+		if ifNoneMatch == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -520,7 +837,7 @@ func formatJSONResponse(messages []stream.Message) []byte {
 }
 
 // handleSSE handles Server-Sent Events streaming.
-func (s *Server) handleSSE(ctx context.Context, w http.ResponseWriter, str stream.Stream, initialOffset stream.Offset) {
+func (s *Server) handleSSE(ctx context.Context, w http.ResponseWriter, str stream.Stream, initialOffset stream.Offset, clientCursor string) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -537,6 +854,7 @@ func (s *Server) handleSSE(ctx context.Context, w http.ResponseWriter, str strea
 
 	currentOffset := initialOffset
 	isJsonStream := isJSONContentType(str.ContentType())
+	lastCursor := clientCursor // Initialize from client cursor for monotonic progression
 
 	// Send initial data then wait for more
 	for {
@@ -581,9 +899,14 @@ func (s *Server) handleSSE(ctx context.Context, w http.ResponseWriter, str strea
 			controlOffset = lastMsg.Offset
 		}
 
+		// Generate cursor ensuring monotonic progression
+		sseCursor := generateResponseCursor(lastCursor)
+		lastCursor = sseCursor
+
 		controlData := map[string]interface{}{
-			"offset":   string(controlOffset),
-			"upToDate": batch.Len() == 0 || controlOffset == str.CurrentOffset(),
+			"streamNextOffset": string(controlOffset),
+			"streamCursor":     sseCursor,
+			"upToDate":         batch.Len() == 0 || controlOffset == str.CurrentOffset(),
 		}
 		controlJSON, _ := encodeJSON(controlData)
 
@@ -610,9 +933,13 @@ func (s *Server) handleSSE(ctx context.Context, w http.ResponseWriter, str strea
 			if result.TimedOut {
 				// Send keepalive control event and exit
 				// In production this would loop, but for testing we exit after one timeout
+				keepAliveCursor := generateResponseCursor(lastCursor)
+				lastCursor = keepAliveCursor
+
 				keepAliveData := map[string]interface{}{
-					"offset":   string(currentOffset),
-					"upToDate": true,
+					"streamNextOffset": string(currentOffset),
+					"streamCursor":     keepAliveCursor,
+					"upToDate":         true,
 				}
 				keepAliveJSON, _ := encodeJSON(keepAliveData)
 				w.Write([]byte("event: control\n"))

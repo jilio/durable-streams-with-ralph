@@ -33,6 +33,22 @@ var (
 
 	// ErrStreamExpired is returned when the stream has expired (TTL or ExpiresAt).
 	ErrStreamExpired = errors.New("stream has expired")
+
+	// ErrProducerStaleEpoch is returned when a producer's epoch is less than
+	// the current server-stored epoch (zombie fencing).
+	ErrProducerStaleEpoch = errors.New("stale producer epoch")
+
+	// ErrProducerInvalidEpochSeq is returned when a new epoch doesn't start at seq=0.
+	ErrProducerInvalidEpochSeq = errors.New("new epoch must start with sequence 0")
+
+	// ErrProducerSequenceGap is returned when there's a gap in the sequence numbers.
+	ErrProducerSequenceGap = errors.New("producer sequence gap")
+
+	// ErrProducerHeadersIncomplete is returned when only some producer headers are provided.
+	ErrProducerHeadersIncomplete = errors.New("all producer headers must be provided together")
+
+	// ErrProducerIdEmpty is returned when Producer-Id header is empty.
+	ErrProducerIdEmpty = errors.New("Producer-Id must not be empty")
 )
 
 // StreamStorage defines the interface for stream storage backends.
@@ -81,3 +97,47 @@ type StreamMetadata struct {
 	// CreatedAt is when the stream was created (Unix timestamp milliseconds).
 	CreatedAt int64
 }
+
+// ProducerState holds the state for an idempotent producer.
+type ProducerState struct {
+	// Epoch is the current producer epoch (increments on restart).
+	Epoch int64
+
+	// LastSeq is the last accepted sequence number.
+	LastSeq int64
+
+	// LastUpdated is when this state was last modified (Unix ms).
+	LastUpdated int64
+}
+
+// ProducerResult is the result of producer validation.
+type ProducerResult struct {
+	// Status indicates the validation result.
+	Status ProducerStatus
+
+	// IsDuplicate is true if this was a duplicate request (idempotent success).
+	IsDuplicate bool
+
+	// CurrentEpoch is returned on stale epoch errors.
+	CurrentEpoch int64
+
+	// ExpectedSeq is returned on sequence gap errors.
+	ExpectedSeq int64
+
+	// ReceivedSeq is returned on sequence gap errors.
+	ReceivedSeq int64
+
+	// LastSeq is the highest accepted seq (for duplicate responses).
+	LastSeq int64
+}
+
+// ProducerStatus indicates the result of producer validation.
+type ProducerStatus int
+
+const (
+	ProducerStatusAccepted ProducerStatus = iota
+	ProducerStatusDuplicate
+	ProducerStatusStaleEpoch
+	ProducerStatusInvalidEpochSeq
+	ProducerStatusSequenceGap
+)

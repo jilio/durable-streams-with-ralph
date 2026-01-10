@@ -24,6 +24,16 @@ type Stream interface {
 	// Returns an error if the append fails.
 	Append(ctx context.Context, data []byte) (Offset, error)
 
+	// AppendWithSeq appends data with sequence ordering enforcement.
+	// If seq is provided and <= lastSeq, returns ErrSeqConflict.
+	// On success, updates lastSeq to the provided value.
+	AppendWithSeq(ctx context.Context, data []byte, seq string) (Offset, error)
+
+	// AppendWithProducer appends data with idempotent producer support.
+	// Returns the offset and producer validation result.
+	// If the producer validation fails, no data is appended.
+	AppendWithProducer(ctx context.Context, data []byte, producerId string, epoch, seq int64) (Offset, *ProducerResult)
+
 	// ReadFrom reads messages starting after the given offset.
 	// Use StartOffset (-1) to read from the beginning.
 	// Returns a Batch containing zero or more messages.

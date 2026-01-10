@@ -19,6 +19,8 @@ type memoryStreamData struct {
 	messages  []Message
 	offsetGen *OffsetGenerator
 	createdAt int64
+	lastSeq   string // Last accepted Stream-Seq value
+	producers map[string]*ProducerState
 	mu        sync.RWMutex
 }
 
@@ -73,6 +75,7 @@ func (s *MemoryStorage) Create(ctx context.Context, config StreamConfig) error {
 		messages:  make([]Message, 0),
 		offsetGen: NewOffsetGenerator(),
 		createdAt: time.Now().UnixMilli(),
+		producers: make(map[string]*ProducerState),
 	}
 
 	return nil // New stream created
@@ -108,6 +111,7 @@ func (s *MemoryStorage) CreateOrMatch(ctx context.Context, config StreamConfig) 
 		messages:  make([]Message, 0),
 		offsetGen: NewOffsetGenerator(),
 		createdAt: time.Now().UnixMilli(),
+		producers: make(map[string]*ProducerState),
 	}
 
 	return true, nil
@@ -248,6 +252,120 @@ func (m *memoryStream) Append(ctx context.Context, data []byte) (Offset, error) 
 	m.data.messages = append(m.data.messages, msg)
 
 	return offset, nil
+}
+
+// AppendWithSeq appends data with sequence ordering enforcement.
+// Uses lexicographic string comparison for sequence ordering.
+func (m *memoryStream) AppendWithSeq(ctx context.Context, data []byte, seq string) (Offset, error) {
+	m.data.mu.Lock()
+	defer m.data.mu.Unlock()
+
+	// Check sequence ordering (lexicographic comparison)
+	if seq != "" && m.data.lastSeq != "" && seq <= m.data.lastSeq {
+		return "", ErrSeqConflict
+	}
+
+	// Generate the next offset
+	offset := m.data.offsetGen.Next(len(data))
+
+	// Create the message
+	msg := NewMessage(data, offset, time.Now())
+	m.data.messages = append(m.data.messages, msg)
+
+	// Update lastSeq on successful append
+	if seq != "" {
+		m.data.lastSeq = seq
+	}
+
+	return offset, nil
+}
+
+// AppendWithProducer appends data with idempotent producer support.
+// Returns the offset and producer validation result.
+func (m *memoryStream) AppendWithProducer(ctx context.Context, data []byte, producerId string, epoch, seq int64) (Offset, *ProducerResult) {
+	m.data.mu.Lock()
+	defer m.data.mu.Unlock()
+
+	now := time.Now().UnixMilli()
+
+	// Initialize producers map if needed
+	if m.data.producers == nil {
+		m.data.producers = make(map[string]*ProducerState)
+	}
+
+	state := m.data.producers[producerId]
+
+	// New producer - accept if seq is 0
+	if state == nil {
+		if seq != 0 {
+			return "", &ProducerResult{
+				Status:      ProducerStatusSequenceGap,
+				ExpectedSeq: 0,
+				ReceivedSeq: seq,
+			}
+		}
+		// Accept new producer
+		offset := m.data.offsetGen.Next(len(data))
+		msg := NewMessage(data, offset, time.Now())
+		m.data.messages = append(m.data.messages, msg)
+		m.data.producers[producerId] = &ProducerState{
+			Epoch:       epoch,
+			LastSeq:     0,
+			LastUpdated: now,
+		}
+		return offset, &ProducerResult{Status: ProducerStatusAccepted}
+	}
+
+	// Epoch validation (client-declared, server-validated)
+	if epoch < state.Epoch {
+		return "", &ProducerResult{
+			Status:       ProducerStatusStaleEpoch,
+			CurrentEpoch: state.Epoch,
+		}
+	}
+
+	if epoch > state.Epoch {
+		// New epoch must start at seq=0
+		if seq != 0 {
+			return "", &ProducerResult{Status: ProducerStatusInvalidEpochSeq}
+		}
+		// Accept new epoch
+		offset := m.data.offsetGen.Next(len(data))
+		msg := NewMessage(data, offset, time.Now())
+		m.data.messages = append(m.data.messages, msg)
+		m.data.producers[producerId] = &ProducerState{
+			Epoch:       epoch,
+			LastSeq:     0,
+			LastUpdated: now,
+		}
+		return offset, &ProducerResult{Status: ProducerStatusAccepted}
+	}
+
+	// Same epoch: sequence validation
+	if seq <= state.LastSeq {
+		return "", &ProducerResult{
+			Status:      ProducerStatusDuplicate,
+			IsDuplicate: true,
+			LastSeq:     state.LastSeq,
+		}
+	}
+
+	if seq == state.LastSeq+1 {
+		// Accept next sequence
+		offset := m.data.offsetGen.Next(len(data))
+		msg := NewMessage(data, offset, time.Now())
+		m.data.messages = append(m.data.messages, msg)
+		state.LastSeq = seq
+		state.LastUpdated = now
+		return offset, &ProducerResult{Status: ProducerStatusAccepted}
+	}
+
+	// Sequence gap
+	return "", &ProducerResult{
+		Status:      ProducerStatusSequenceGap,
+		ExpectedSeq: state.LastSeq + 1,
+		ReceivedSeq: seq,
+	}
 }
 
 // ReadFrom reads messages starting after the given offset.

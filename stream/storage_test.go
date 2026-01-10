@@ -94,6 +94,17 @@ func (w *mockStorageStreamWrapper) Append(ctx context.Context, data []byte) (Off
 	return offset, nil
 }
 
+func (w *mockStorageStreamWrapper) AppendWithSeq(ctx context.Context, data []byte, seq string) (Offset, error) {
+	// Simple mock implementation - just append without seq checking
+	return w.Append(ctx, data)
+}
+
+func (w *mockStorageStreamWrapper) AppendWithProducer(ctx context.Context, data []byte, producerId string, epoch, seq int64) (Offset, *ProducerResult) {
+	// Simple mock implementation - just append
+	offset, _ := w.Append(ctx, data)
+	return offset, &ProducerResult{Status: ProducerStatusAccepted}
+}
+
 func (w *mockStorageStreamWrapper) ReadFrom(ctx context.Context, offset Offset) (Batch, error) {
 	var msgs []Message
 	for _, msg := range w.s.messages {

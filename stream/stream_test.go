@@ -43,6 +43,17 @@ func (m *mockStream) Append(ctx context.Context, data []byte) (Offset, error) {
 	return offset, nil
 }
 
+func (m *mockStream) AppendWithSeq(ctx context.Context, data []byte, seq string) (Offset, error) {
+	// Simple mock implementation - just append without seq checking
+	return m.Append(ctx, data)
+}
+
+func (m *mockStream) AppendWithProducer(ctx context.Context, data []byte, producerId string, epoch, seq int64) (Offset, *ProducerResult) {
+	// Simple mock implementation - just append
+	offset, _ := m.Append(ctx, data)
+	return offset, &ProducerResult{Status: ProducerStatusAccepted}
+}
+
 func (m *mockStream) ReadFrom(ctx context.Context, offset Offset) (Batch, error) {
 	var msgs []Message
 	for _, msg := range m.messages {
