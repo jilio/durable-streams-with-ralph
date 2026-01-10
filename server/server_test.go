@@ -423,3 +423,245 @@ func TestServer_PostAppendMultiple(t *testing.T) {
 		t.Errorf("offset2 (%s) should be > offset1 (%s)", offset2, offset1)
 	}
 }
+
+// GET (Read) tests
+
+func TestServer_GetReadStreamNotFound(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	req := httptest.NewRequest(http.MethodGet, "/nonexistent/stream", nil)
+
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestServer_GetReadEmptyStream(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Read from start
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?offset=-1", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// Check headers
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	if offset := resp.Header.Get("Stream-Next-Offset"); offset != string(stream.InitialOffset) {
+		t.Errorf("Stream-Next-Offset = %q, want %q", offset, stream.InitialOffset)
+	}
+	if upToDate := resp.Header.Get("Stream-Up-To-Date"); upToDate != "true" {
+		t.Errorf("Stream-Up-To-Date = %q, want %q", upToDate, "true")
+	}
+
+	// Body should be empty array for JSON
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "[]" {
+		t.Errorf("Body = %q, want %q", body, "[]")
+	}
+}
+
+func TestServer_GetReadWithMessages(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Append messages
+	body1 := strings.NewReader(`{"event":"first"}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/test/stream", body1)
+	req1.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req1)
+
+	body2 := strings.NewReader(`{"event":"second"}`)
+	req2 := httptest.NewRequest(http.MethodPost, "/test/stream", body2)
+	req2.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req2)
+
+	// Read from start
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?offset=-1", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	// Should contain both messages in JSON array format
+	if !strings.Contains(string(body), `{"event":"first"}`) {
+		t.Errorf("Body missing first event: %q", body)
+	}
+	if !strings.Contains(string(body), `{"event":"second"}`) {
+		t.Errorf("Body missing second event: %q", body)
+	}
+}
+
+func TestServer_GetReadFromOffset(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Append first message
+	body1 := strings.NewReader(`{"event":"first"}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/test/stream", body1)
+	req1.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req1)
+	offset1 := w.Result().Header.Get("Stream-Next-Offset")
+
+	// Append second message
+	body2 := strings.NewReader(`{"event":"second"}`)
+	req2 := httptest.NewRequest(http.MethodPost, "/test/stream", body2)
+	req2.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req2)
+
+	// Read from offset1 (should only get second message)
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?offset="+offset1, nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	// Should NOT contain first message
+	if strings.Contains(string(body), `"first"`) {
+		t.Errorf("Body should not contain first event: %q", body)
+	}
+	// Should contain second message
+	if !strings.Contains(string(body), `{"event":"second"}`) {
+		t.Errorf("Body missing second event: %q", body)
+	}
+}
+
+func TestServer_GetReadOffsetNow(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream with data
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", strings.NewReader(`{"event":"initial"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Read with offset=now (should return empty, just the current offset)
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?offset=now", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// Should have up-to-date header
+	if upToDate := resp.Header.Get("Stream-Up-To-Date"); upToDate != "true" {
+		t.Errorf("Stream-Up-To-Date = %q, want %q", upToDate, "true")
+	}
+
+	// Should return empty array (no messages after "now")
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "[]" {
+		t.Errorf("Body = %q, want %q", body, "[]")
+	}
+}
+
+func TestServer_GetReadEmptyOffset(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Read with empty offset (should be 400)
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?offset=", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestServer_GetReadInvalidOffset(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Read with invalid offset
+	req := httptest.NewRequest(http.MethodGet, "/test/stream?offset=invalid!", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestServer_GetReadNoOffsetParam(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream with data
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", strings.NewReader(`{"event":"test"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Read without offset param (should read from start, offset=-1)
+	req := httptest.NewRequest(http.MethodGet, "/test/stream", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// Should have the message
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `{"event":"test"}`) {
+		t.Errorf("Body missing event: %q", body)
+	}
+}

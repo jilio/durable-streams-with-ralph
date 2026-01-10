@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jilio/durable-streams-with-ralph/stream"
@@ -51,6 +52,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	switch r.Method {
+	case http.MethodGet:
+		s.handleRead(w, r, path)
 	case http.MethodPut:
 		s.handleCreate(w, r, path)
 	case http.MethodPost:
@@ -203,6 +206,100 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleRead handles GET requests to read from a stream.
+func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string) {
+	ctx := r.Context()
+
+	// Get the stream
+	str, ok := s.getStream(ctx, w, path)
+	if !ok {
+		return
+	}
+
+	// Get offset from query parameter
+	offset := r.URL.Query().Get("offset")
+
+	// Check if offset parameter was provided but empty
+	if r.URL.Query().Has("offset") && offset == "" {
+		http.Error(w, "Empty offset parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Validate offset format if provided
+	if offset != "" {
+		validOffsetPattern := regexp.MustCompile(`^(-1|now|\d+_\d+)$`)
+		if !validOffsetPattern.MatchString(offset) {
+			http.Error(w, "Invalid offset format", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Handle offset=now (return current tail offset with empty response)
+	if offset == "now" {
+		currentOffset := str.CurrentOffset()
+		w.Header().Set(HeaderContentType, str.ContentType())
+		w.Header().Set(HeaderStreamOffset, string(currentOffset))
+		w.Header().Set(HeaderStreamUpToDate, "true")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+
+		// For JSON content type, return empty array
+		if isJSONContentType(str.ContentType()) {
+			w.Write([]byte("[]"))
+		}
+		return
+	}
+
+	// Default offset is StartOffset (-1) if not provided
+	readOffset := stream.StartOffset
+	if offset != "" && offset != "-1" {
+		readOffset = stream.Offset(offset)
+	}
+
+	// Read messages from the stream
+	batch, err := str.ReadFrom(ctx, readOffset)
+	if err != nil {
+		http.Error(w, "Failed to read stream", http.StatusInternalServerError)
+		return
+	}
+
+	// Build response
+	w.Header().Set(HeaderContentType, str.ContentType())
+
+	// Set offset header to last message's offset, or current if no messages
+	responseOffset := str.CurrentOffset()
+	if lastMsg, ok := batch.Last(); ok {
+		responseOffset = lastMsg.Offset
+	}
+	w.Header().Set(HeaderStreamOffset, string(responseOffset))
+
+	// Set up-to-date header if we've caught up
+	lastMsg, hasLast := batch.Last()
+	if !hasLast || lastMsg.Offset == str.CurrentOffset() {
+		w.Header().Set(HeaderStreamUpToDate, "true")
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	// Format response
+	if isJSONContentType(str.ContentType()) {
+		// JSON mode: wrap messages in array
+		w.Write([]byte("["))
+		for i, msg := range batch.Messages {
+			if i > 0 {
+				w.Write([]byte(","))
+			}
+			w.Write(msg.Data)
+		}
+		w.Write([]byte("]"))
+	} else {
+		// Binary mode: concatenate raw data
+		for _, msg := range batch.Messages {
+			w.Write(msg.Data)
+		}
+	}
+}
+
 // handleOptions handles OPTIONS requests for CORS preflight.
 func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(HeaderAllow, "GET, POST, PUT, DELETE, HEAD, OPTIONS")
@@ -214,6 +311,11 @@ func isValidContentType(ct string) bool {
 	// Basic MIME type format: type/subtype
 	pattern := regexp.MustCompile(`^[\w-]+/[\w-]+`)
 	return pattern.MatchString(ct)
+}
+
+// isJSONContentType checks if the content type is JSON.
+func isJSONContentType(ct string) bool {
+	return strings.Contains(ct, "application/json")
 }
 
 // parseTTL parses and validates a TTL header value.
