@@ -143,3 +143,8 @@ func TestRedisStorageImplementsInterface(t *testing.T) {
 	// Compile-time check that RedisStorage implements StreamStorage
 	var _ StreamStorage = (*RedisStorage)(nil)
 }
+
+func TestRedisStreamImplementsInterface(t *testing.T) {
+	// Compile-time check that redisStream implements Stream
+	var _ Stream = (*redisStream)(nil)
+}

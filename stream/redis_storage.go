@@ -356,12 +356,22 @@ func (s *RedisStorage) Exists(ctx context.Context, path string) (bool, error) {
 }
 
 // Head returns metadata about a stream without reading its content.
+// Uses pipelining to fetch metadata and offset in a single round-trip.
 func (s *RedisStorage) Head(ctx context.Context, path string) (*StreamMetadata, error) {
 	mk := metaKey(path)
 	sk := streamKey(path)
 
-	// Get metadata
-	result, err := s.client.HGetAll(ctx, mk).Result()
+	// Use pipeline to fetch metadata and last entry in one round-trip
+	pipe := s.client.Pipeline()
+	metaCmd := pipe.HGetAll(ctx, mk)
+	lastEntryCmd := pipe.XRevRangeN(ctx, sk, "+", "-", 1)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		return nil, fmt.Errorf("failed to get stream metadata: %w", err)
+	}
+
+	result, err := metaCmd.Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get stream metadata: %w", err)
 	}
@@ -369,12 +379,7 @@ func (s *RedisStorage) Head(ctx context.Context, path string) (*StreamMetadata, 
 		return nil, ErrStreamNotFound
 	}
 
-	// Get the last message to determine current offset
-	// XREVRANGE key + - COUNT 1 gets the last entry
-	entries, err := s.client.XRevRangeN(ctx, sk, "+", "-", 1).Result()
-	if err != nil && err != redis.Nil {
-		return nil, fmt.Errorf("failed to get stream offset: %w", err)
-	}
+	entries, _ := lastEntryCmd.Result()
 
 	var nextOffset Offset = "0_0"
 	if len(entries) > 0 {
@@ -395,6 +400,58 @@ func (s *RedisStorage) Head(ctx context.Context, path string) (*StreamMetadata, 
 		ExpiresAt:   result[redisFieldExpiresAt],
 		CreatedAt:   createdAt,
 	}, nil
+}
+
+// AppendBatch appends multiple messages to a stream in a single pipeline.
+// Returns the offsets for each message.
+func (s *RedisStorage) AppendBatch(ctx context.Context, path string, messages [][]byte) ([]Offset, error) {
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	stream, err := s.Get(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+
+	rs := stream.(*redisStream)
+	sk := streamKey(path)
+
+	// Initialize offset generator
+	if rs.offsetGen == nil {
+		currentOffset := rs.CurrentOffset()
+		if currentOffset != "0_0" && currentOffset != "" {
+			rs.offsetGen = NewOffsetGeneratorFrom(currentOffset)
+		} else {
+			rs.offsetGen = NewOffsetGenerator()
+		}
+	}
+
+	// Use pipeline to batch all XADD commands
+	pipe := s.client.Pipeline()
+	offsets := make([]Offset, len(messages))
+	now := time.Now().UnixMilli()
+
+	for i, data := range messages {
+		offset := rs.offsetGen.Next(len(data))
+		offsets[i] = offset
+
+		pipe.XAdd(ctx, &redis.XAddArgs{
+			Stream: sk,
+			Values: map[string]interface{}{
+				redisFieldData:      encodeData(data),
+				redisFieldOffset:    string(offset),
+				redisFieldTimestamp: now,
+			},
+		})
+	}
+
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to append batch: %w", err)
+	}
+
+	return offsets, nil
 }
 
 // redisStream implements Stream interface for Redis-backed streams.
