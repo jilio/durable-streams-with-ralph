@@ -686,27 +686,87 @@ func (r *redisStream) ReadFrom(ctx context.Context, offset Offset) (Batch, error
 }
 
 func (r *redisStream) WaitForMessages(ctx context.Context, offset Offset, timeout time.Duration) WaitResult {
-	// For now, implement simple polling (XREAD BLOCK will be added in task 3my.5)
-	deadline := time.Now().Add(timeout)
-	pollInterval := 10 * time.Millisecond
+	sk := streamKey(r.path)
 
-	for {
-		batch, err := r.ReadFrom(ctx, offset)
-		if err == nil && len(batch.Messages) > 0 {
-			return WaitResult{Messages: batch.Messages, TimedOut: false}
+	// First, check if there are already messages after the given offset
+	batch, err := r.ReadFrom(ctx, offset)
+	if err == nil && len(batch.Messages) > 0 {
+		return WaitResult{Messages: batch.Messages, TimedOut: false}
+	}
+
+	// Find the last Redis stream ID to use as starting point for XREAD BLOCK
+	// We need to find the Redis ID corresponding to our offset
+	lastRedisID := "0-0" // Start from beginning if no messages
+
+	// Get all entries to find the one matching our offset
+	entries, err := r.storage.client.XRange(ctx, sk, "-", "+").Result()
+	if err == nil && len(entries) > 0 {
+		// Find the entry with our offset or the last entry
+		for _, entry := range entries {
+			if msgOffset, ok := entry.Values[redisFieldOffset].(string); ok {
+				if Offset(msgOffset).Compare(offset) <= 0 {
+					lastRedisID = entry.ID
+				}
+			}
 		}
+		// If offset is beyond all entries, use the last entry's ID
+		if lastRedisID == "0-0" && len(entries) > 0 {
+			lastRedisID = entries[len(entries)-1].ID
+		}
+	}
 
-		if time.Now().After(deadline) {
+	// Use XREAD BLOCK for efficient waiting
+	timeoutMs := timeout.Milliseconds()
+	if timeoutMs <= 0 {
+		timeoutMs = 1 // Minimum 1ms
+	}
+
+	streams, err := r.storage.client.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{sk, lastRedisID},
+		Block:   time.Duration(timeoutMs) * time.Millisecond,
+		Count:   100, // Reasonable batch size
+	}).Result()
+
+	if err != nil {
+		// XREAD returns error on timeout (redis.Nil)
+		if err == redis.Nil {
 			return WaitResult{TimedOut: true}
 		}
-
+		// Check for context cancellation
 		select {
 		case <-ctx.Done():
 			return WaitResult{TimedOut: true}
-		case <-time.After(pollInterval):
-			// Continue polling
+		default:
+		}
+		return WaitResult{TimedOut: true}
+	}
+
+	// Process received messages
+	var msgs []Message
+	for _, stream := range streams {
+		for _, entry := range stream.Messages {
+			msgOffset := Offset(entry.Values[redisFieldOffset].(string))
+
+			// Filter: only include messages after the given offset
+			if offset.IsStart() || msgOffset.Compare(offset) > 0 {
+				dataStr := entry.Values[redisFieldData].(string)
+				data, err := decodeData(dataStr)
+				if err != nil {
+					continue
+				}
+
+				ts, _ := strconv.ParseInt(entry.Values[redisFieldTimestamp].(string), 10, 64)
+				msg := NewMessage(data, msgOffset, time.UnixMilli(ts))
+				msgs = append(msgs, msg)
+			}
 		}
 	}
+
+	if len(msgs) > 0 {
+		return WaitResult{Messages: msgs, TimedOut: false}
+	}
+
+	return WaitResult{TimedOut: true}
 }
 
 // Ensure interfaces are implemented
