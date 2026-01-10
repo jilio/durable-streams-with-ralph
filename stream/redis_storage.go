@@ -207,6 +207,9 @@ func (s *RedisStorage) PoolStats() *redis.PoolStats {
 
 // Helper functions for key generation
 
+// encodePathForRedis encodes a stream path for use in Redis keys.
+// PERF: Called frequently (7% of allocations). Consider caching
+// encoded paths in a sync.Map for frequently accessed streams.
 func encodePathForRedis(path string) string {
 	return url.PathEscape(path)
 }
@@ -228,6 +231,9 @@ func seqKey(path string) string {
 }
 
 // encodeData encodes binary data for safe storage in Redis
+// PERF: This is a hot path (67% of allocations in benchmarks).
+// Base64 encoding adds ~33% size overhead and allocation per message.
+// Consider raw binary storage if go-redis adds XADD binary support.
 func encodeData(data []byte) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
@@ -701,7 +707,9 @@ func (r *redisStream) ReadFrom(ctx context.Context, offset Offset) (Batch, error
 	sk := streamKey(r.path)
 
 	// Read all entries from the stream
-	// For offset-based filtering, we need to read all and filter
+	// PERF: This is O(n) where n = total messages. For large streams,
+	// consider using XREAD with Redis ID tracking for incremental reads,
+	// or add pagination with COUNT parameter.
 	entries, err := r.storage.client.XRange(ctx, sk, "-", "+").Result()
 	if err != nil {
 		return Batch{}, fmt.Errorf("failed to read stream: %w", err)
