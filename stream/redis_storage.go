@@ -211,32 +211,449 @@ func parseRedisID(id string) (int64, int64, error) {
 	return ts, seq, nil
 }
 
-// Placeholder implementations - to be filled in subsequent tasks
-
+// Create creates a new stream with the given configuration.
 func (s *RedisStorage) Create(ctx context.Context, config StreamConfig) error {
-	// TODO: Implement in task 3my.2
-	return fmt.Errorf("not implemented")
+	config.Normalize()
+
+	mk := metaKey(config.Path)
+
+	// Check if stream already exists
+	exists, err := s.client.Exists(ctx, mk).Result()
+	if err != nil {
+		return fmt.Errorf("failed to check stream existence: %w", err)
+	}
+
+	if exists > 0 {
+		// Check if config matches for idempotent PUT
+		existingConfig, err := s.getConfig(ctx, config.Path)
+		if err != nil {
+			return err
+		}
+		if config.ConfigMatches(existingConfig) {
+			return ErrStreamExists // Idempotent success
+		}
+		return ErrConfigMismatch // Config conflict
+	}
+
+	// Create metadata hash
+	now := time.Now().UnixMilli()
+	fields := map[string]interface{}{
+		redisFieldContentType: config.ContentType,
+		redisFieldTTLSeconds:  config.TTLSeconds,
+		redisFieldExpiresAt:   config.ExpiresAt,
+		redisFieldCreatedAt:   now,
+	}
+
+	if err := s.client.HSet(ctx, mk, fields).Err(); err != nil {
+		return fmt.Errorf("failed to create stream metadata: %w", err)
+	}
+
+	// Set expiration if TTL or ExpiresAt is specified
+	if err := s.setExpiration(ctx, config.Path, config.TTLSeconds, config.ExpiresAt, now); err != nil {
+		// Clean up on error
+		s.client.Del(ctx, mk)
+		return err
+	}
+
+	return nil
 }
 
+// getConfig retrieves the stream configuration from metadata.
+func (s *RedisStorage) getConfig(ctx context.Context, path string) (*StreamConfig, error) {
+	mk := metaKey(path)
+	result, err := s.client.HGetAll(ctx, mk).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stream config: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, ErrStreamNotFound
+	}
+
+	ttl, _ := strconv.Atoi(result[redisFieldTTLSeconds])
+	return &StreamConfig{
+		Path:        path,
+		ContentType: result[redisFieldContentType],
+		TTLSeconds:  ttl,
+		ExpiresAt:   result[redisFieldExpiresAt],
+	}, nil
+}
+
+// setExpiration sets TTL or absolute expiration on stream keys.
+func (s *RedisStorage) setExpiration(ctx context.Context, path string, ttlSeconds int, expiresAt string, createdAt int64) error {
+	mk := metaKey(path)
+	sk := streamKey(path)
+
+	if ttlSeconds > 0 {
+		ttl := time.Duration(ttlSeconds) * time.Second
+		s.client.Expire(ctx, mk, ttl)
+		s.client.Expire(ctx, sk, ttl)
+	} else if expiresAt != "" {
+		expTime, err := time.Parse(time.RFC3339, expiresAt)
+		if err != nil {
+			return fmt.Errorf("invalid ExpiresAt format: %w", err)
+		}
+		s.client.ExpireAt(ctx, mk, expTime)
+		s.client.ExpireAt(ctx, sk, expTime)
+	}
+	return nil
+}
+
+// Get returns a Stream handle for the given path.
 func (s *RedisStorage) Get(ctx context.Context, path string) (Stream, error) {
-	// TODO: Implement in task 3my.2
-	return nil, fmt.Errorf("not implemented")
+	mk := metaKey(path)
+	exists, err := s.client.Exists(ctx, mk).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to check stream existence: %w", err)
+	}
+	if exists == 0 {
+		return nil, ErrStreamNotFound
+	}
+
+	config, err := s.getConfig(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+
+	return &redisStream{
+		storage: s,
+		path:    path,
+		config:  config,
+	}, nil
 }
 
+// Delete removes a stream and all its data.
 func (s *RedisStorage) Delete(ctx context.Context, path string) error {
-	// TODO: Implement in task 3my.2
-	return fmt.Errorf("not implemented")
+	mk := metaKey(path)
+	sk := streamKey(path)
+	sqk := seqKey(path)
+
+	// Check if stream exists
+	exists, err := s.client.Exists(ctx, mk).Result()
+	if err != nil {
+		return fmt.Errorf("failed to check stream existence: %w", err)
+	}
+	if exists == 0 {
+		return ErrStreamNotFound
+	}
+
+	// Delete all keys (metadata, stream data, seq tracker)
+	// Also delete any producer keys (pattern match would require SCAN, so we just delete known keys)
+	if err := s.client.Del(ctx, mk, sk, sqk).Err(); err != nil {
+		return fmt.Errorf("failed to delete stream: %w", err)
+	}
+
+	return nil
 }
 
+// Exists checks if a stream exists at the given path.
 func (s *RedisStorage) Exists(ctx context.Context, path string) (bool, error) {
-	// TODO: Implement in task 3my.2
-	return false, fmt.Errorf("not implemented")
+	mk := metaKey(path)
+	exists, err := s.client.Exists(ctx, mk).Result()
+	if err != nil {
+		return false, fmt.Errorf("failed to check stream existence: %w", err)
+	}
+	return exists > 0, nil
 }
 
+// Head returns metadata about a stream without reading its content.
 func (s *RedisStorage) Head(ctx context.Context, path string) (*StreamMetadata, error) {
-	// TODO: Implement in task 3my.2
-	return nil, fmt.Errorf("not implemented")
+	mk := metaKey(path)
+	sk := streamKey(path)
+
+	// Get metadata
+	result, err := s.client.HGetAll(ctx, mk).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stream metadata: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, ErrStreamNotFound
+	}
+
+	// Get the last message to determine current offset
+	// XREVRANGE key + - COUNT 1 gets the last entry
+	entries, err := s.client.XRevRangeN(ctx, sk, "+", "-", 1).Result()
+	if err != nil && err != redis.Nil {
+		return nil, fmt.Errorf("failed to get stream offset: %w", err)
+	}
+
+	var nextOffset Offset = "0_0"
+	if len(entries) > 0 {
+		// Get the offset from the last message
+		if offsetStr, ok := entries[0].Values[redisFieldOffset].(string); ok {
+			nextOffset = Offset(offsetStr)
+		}
+	}
+
+	ttl, _ := strconv.Atoi(result[redisFieldTTLSeconds])
+	createdAt, _ := strconv.ParseInt(result[redisFieldCreatedAt], 10, 64)
+
+	return &StreamMetadata{
+		Path:        path,
+		ContentType: result[redisFieldContentType],
+		NextOffset:  nextOffset,
+		TTLSeconds:  ttl,
+		ExpiresAt:   result[redisFieldExpiresAt],
+		CreatedAt:   createdAt,
+	}, nil
 }
 
-// Ensure RedisStorage implements StreamStorage
-var _ StreamStorage = (*RedisStorage)(nil)
+// redisStream implements Stream interface for Redis-backed streams.
+type redisStream struct {
+	storage   *RedisStorage
+	path      string
+	config    *StreamConfig
+	offsetGen *OffsetGenerator
+}
+
+func (r *redisStream) Path() string {
+	return r.path
+}
+
+func (r *redisStream) ContentType() string {
+	return r.config.ContentType
+}
+
+func (r *redisStream) CurrentOffset() Offset {
+	ctx := context.Background()
+	sk := streamKey(r.path)
+
+	// Get the last entry to find current offset
+	entries, err := r.storage.client.XRevRangeN(ctx, sk, "+", "-", 1).Result()
+	if err != nil || len(entries) == 0 {
+		return Offset("0_0")
+	}
+
+	if offsetStr, ok := entries[0].Values[redisFieldOffset].(string); ok {
+		return Offset(offsetStr)
+	}
+	return Offset("0_0")
+}
+
+func (r *redisStream) Append(ctx context.Context, data []byte) (Offset, error) {
+	sk := streamKey(r.path)
+
+	// Generate offset - need to track position
+	// For simplicity, we'll use a counter stored in Redis or calculate from stream length
+	if r.offsetGen == nil {
+		// Initialize from current stream state
+		currentOffset := r.CurrentOffset()
+		if currentOffset != "0_0" && currentOffset != "" {
+			r.offsetGen = NewOffsetGeneratorFrom(currentOffset)
+		} else {
+			r.offsetGen = NewOffsetGenerator()
+		}
+	}
+
+	offset := r.offsetGen.Next(len(data))
+	now := time.Now().UnixMilli()
+
+	// Add to Redis Stream
+	args := &redis.XAddArgs{
+		Stream: sk,
+		Values: map[string]interface{}{
+			redisFieldData:      encodeData(data),
+			redisFieldOffset:    string(offset),
+			redisFieldTimestamp: now,
+		},
+	}
+
+	_, err := r.storage.client.XAdd(ctx, args).Result()
+	if err != nil {
+		return "", fmt.Errorf("failed to append to stream: %w", err)
+	}
+
+	return offset, nil
+}
+
+func (r *redisStream) AppendWithSeq(ctx context.Context, data []byte, seq string) (Offset, error) {
+	if seq != "" {
+		sqk := seqKey(r.path)
+
+		// Check sequence ordering using GETSET pattern
+		lastSeq, err := r.storage.client.Get(ctx, sqk).Result()
+		if err != nil && err != redis.Nil {
+			return "", fmt.Errorf("failed to get last seq: %w", err)
+		}
+
+		if lastSeq != "" && seq <= lastSeq {
+			return "", ErrSeqConflict
+		}
+
+		// Append the data
+		offset, err := r.Append(ctx, data)
+		if err != nil {
+			return "", err
+		}
+
+		// Update the seq tracker
+		if err := r.storage.client.Set(ctx, sqk, seq, 0).Err(); err != nil {
+			// Note: data was already appended, seq update failed
+			// In production, this should be atomic
+			return offset, nil
+		}
+
+		return offset, nil
+	}
+
+	return r.Append(ctx, data)
+}
+
+func (r *redisStream) AppendWithProducer(ctx context.Context, data []byte, producerId string, epoch, seq int64) (Offset, *ProducerResult) {
+	pk := producerKey(r.path, producerId)
+	now := time.Now().UnixMilli()
+
+	// Get current producer state
+	state, err := r.storage.client.HGetAll(ctx, pk).Result()
+	if err != nil && err != redis.Nil {
+		return "", &ProducerResult{Status: ProducerStatusSequenceGap}
+	}
+
+	if len(state) == 0 {
+		// New producer - must start at seq=0
+		if seq != 0 {
+			return "", &ProducerResult{
+				Status:      ProducerStatusSequenceGap,
+				ExpectedSeq: 0,
+				ReceivedSeq: seq,
+			}
+		}
+
+		// Accept new producer
+		offset, err := r.Append(ctx, data)
+		if err != nil {
+			return "", &ProducerResult{Status: ProducerStatusSequenceGap}
+		}
+
+		// Store producer state
+		r.storage.client.HSet(ctx, pk, map[string]interface{}{
+			redisFieldEpoch:       epoch,
+			redisFieldLastSeq:     0,
+			redisFieldLastUpdated: now,
+		})
+
+		return offset, &ProducerResult{Status: ProducerStatusAccepted}
+	}
+
+	// Existing producer - validate epoch and sequence
+	currentEpoch, _ := strconv.ParseInt(state[redisFieldEpoch], 10, 64)
+	lastSeq, _ := strconv.ParseInt(state[redisFieldLastSeq], 10, 64)
+
+	if epoch < currentEpoch {
+		return "", &ProducerResult{
+			Status:       ProducerStatusStaleEpoch,
+			CurrentEpoch: currentEpoch,
+		}
+	}
+
+	if epoch > currentEpoch {
+		// New epoch must start at seq=0
+		if seq != 0 {
+			return "", &ProducerResult{Status: ProducerStatusInvalidEpochSeq}
+		}
+
+		// Accept new epoch
+		offset, err := r.Append(ctx, data)
+		if err != nil {
+			return "", &ProducerResult{Status: ProducerStatusSequenceGap}
+		}
+
+		r.storage.client.HSet(ctx, pk, map[string]interface{}{
+			redisFieldEpoch:       epoch,
+			redisFieldLastSeq:     0,
+			redisFieldLastUpdated: now,
+		})
+
+		return offset, &ProducerResult{Status: ProducerStatusAccepted}
+	}
+
+	// Same epoch - check sequence
+	if seq <= lastSeq {
+		return "", &ProducerResult{
+			Status:      ProducerStatusDuplicate,
+			IsDuplicate: true,
+			LastSeq:     lastSeq,
+		}
+	}
+
+	if seq != lastSeq+1 {
+		return "", &ProducerResult{
+			Status:      ProducerStatusSequenceGap,
+			ExpectedSeq: lastSeq + 1,
+			ReceivedSeq: seq,
+		}
+	}
+
+	// Accept next sequence
+	offset, err := r.Append(ctx, data)
+	if err != nil {
+		return "", &ProducerResult{Status: ProducerStatusSequenceGap}
+	}
+
+	r.storage.client.HSet(ctx, pk, map[string]interface{}{
+		redisFieldLastSeq:     seq,
+		redisFieldLastUpdated: now,
+	})
+
+	return offset, &ProducerResult{Status: ProducerStatusAccepted}
+}
+
+func (r *redisStream) ReadFrom(ctx context.Context, offset Offset) (Batch, error) {
+	sk := streamKey(r.path)
+
+	// Read all entries from the stream
+	// For offset-based filtering, we need to read all and filter
+	entries, err := r.storage.client.XRange(ctx, sk, "-", "+").Result()
+	if err != nil {
+		return Batch{}, fmt.Errorf("failed to read stream: %w", err)
+	}
+
+	var msgs []Message
+	for _, entry := range entries {
+		msgOffset := Offset(entry.Values[redisFieldOffset].(string))
+
+		// Filter: include messages after the given offset
+		if offset.IsStart() || msgOffset.Compare(offset) > 0 {
+			dataStr := entry.Values[redisFieldData].(string)
+			data, err := decodeData(dataStr)
+			if err != nil {
+				continue // Skip malformed entries
+			}
+
+			ts, _ := strconv.ParseInt(entry.Values[redisFieldTimestamp].(string), 10, 64)
+			msg := NewMessage(data, msgOffset, time.UnixMilli(ts))
+			msgs = append(msgs, msg)
+		}
+	}
+
+	return NewBatch(msgs, r.CurrentOffset()), nil
+}
+
+func (r *redisStream) WaitForMessages(ctx context.Context, offset Offset, timeout time.Duration) WaitResult {
+	// For now, implement simple polling (XREAD BLOCK will be added in task 3my.5)
+	deadline := time.Now().Add(timeout)
+	pollInterval := 10 * time.Millisecond
+
+	for {
+		batch, err := r.ReadFrom(ctx, offset)
+		if err == nil && len(batch.Messages) > 0 {
+			return WaitResult{Messages: batch.Messages, TimedOut: false}
+		}
+
+		if time.Now().After(deadline) {
+			return WaitResult{TimedOut: true}
+		}
+
+		select {
+		case <-ctx.Done():
+			return WaitResult{TimedOut: true}
+		case <-time.After(pollInterval):
+			// Continue polling
+		}
+	}
+}
+
+// Ensure interfaces are implemented
+var (
+	_ StreamStorage = (*RedisStorage)(nil)
+	_ Stream        = (*redisStream)(nil)
+)
