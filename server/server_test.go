@@ -286,3 +286,140 @@ func TestServer_PutZeroTTL(t *testing.T) {
 		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusCreated)
 	}
 }
+
+// POST (Append) tests
+
+func TestServer_PostAppend(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// First create the stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	if w.Result().StatusCode != http.StatusCreated {
+		t.Fatalf("Failed to create stream: %d", w.Result().StatusCode)
+	}
+
+	// Now append data
+	body := strings.NewReader(`{"event":"test"}`)
+	req := httptest.NewRequest(http.MethodPost, "/test/stream", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// Check Stream-Next-Offset header
+	offset := resp.Header.Get("Stream-Next-Offset")
+	if offset == "" {
+		t.Error("Stream-Next-Offset header missing")
+	}
+	if offset == string(stream.InitialOffset) {
+		t.Error("Stream-Next-Offset should be updated after append")
+	}
+}
+
+func TestServer_PostAppendEmptyBody(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// First create the stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Append with empty body
+	req := httptest.NewRequest(http.MethodPost, "/test/stream", nil)
+	req.Header.Set("Content-Type", "application/json")
+
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestServer_PostAppendNoContentType(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// First create the stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Append without Content-Type
+	body := strings.NewReader(`{"event":"test"}`)
+	req := httptest.NewRequest(http.MethodPost, "/test/stream", body)
+	// No Content-Type header
+
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestServer_PostAppendStreamNotFound(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	body := strings.NewReader(`{"event":"test"}`)
+	req := httptest.NewRequest(http.MethodPost, "/nonexistent/stream", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestServer_PostAppendMultiple(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := New(storage)
+
+	// Create stream
+	createReq := httptest.NewRequest(http.MethodPut, "/test/stream", nil)
+	createReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, createReq)
+
+	// Append first message
+	body1 := strings.NewReader(`{"event":"first"}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/test/stream", body1)
+	req1.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req1)
+
+	offset1 := w.Result().Header.Get("Stream-Next-Offset")
+
+	// Append second message
+	body2 := strings.NewReader(`{"event":"second"}`)
+	req2 := httptest.NewRequest(http.MethodPost, "/test/stream", body2)
+	req2.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req2)
+
+	offset2 := w.Result().Header.Get("Stream-Next-Offset")
+
+	// Offsets should be increasing
+	if offset2 <= offset1 {
+		t.Errorf("offset2 (%s) should be > offset1 (%s)", offset2, offset1)
+	}
+}

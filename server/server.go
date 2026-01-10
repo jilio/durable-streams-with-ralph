@@ -53,6 +53,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
 		s.handleCreate(w, r, path)
+	case http.MethodPost:
+		s.handleAppend(w, r, path)
 	case http.MethodOptions:
 		s.handleOptions(w, r)
 	default:
@@ -157,6 +159,48 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 	w.Header().Set(HeaderLocation, s.baseURL+path)
 
 	w.WriteHeader(http.StatusCreated)
+}
+
+// handleAppend handles POST requests to append data to a stream.
+func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path string) {
+	ctx := r.Context()
+
+	// Content-Type is required for POST
+	contentType := r.Header.Get(HeaderContentType)
+	if contentType == "" {
+		http.Error(w, "Content-Type header is required", http.StatusBadRequest)
+		return
+	}
+
+	// Read body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+
+	// Empty body is not allowed for append
+	if len(body) == 0 {
+		http.Error(w, "Empty body", http.StatusBadRequest)
+		return
+	}
+
+	// Get the stream
+	str, ok := s.getStream(ctx, w, path)
+	if !ok {
+		return
+	}
+
+	// Append the data
+	nextOffset, err := str.Append(ctx, body)
+	if err != nil {
+		http.Error(w, "Failed to append data", http.StatusInternalServerError)
+		return
+	}
+
+	// Set response headers
+	w.Header().Set(HeaderStreamOffset, string(nextOffset))
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleOptions handles OPTIONS requests for CORS preflight.
