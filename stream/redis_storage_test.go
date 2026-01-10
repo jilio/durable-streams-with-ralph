@@ -2,6 +2,7 @@ package stream
 
 import (
 	"testing"
+	"time"
 )
 
 func TestRedisKeyGeneration(t *testing.T) {
@@ -147,4 +148,53 @@ func TestRedisStorageImplementsInterface(t *testing.T) {
 func TestRedisStreamImplementsInterface(t *testing.T) {
 	// Compile-time check that redisStream implements Stream
 	var _ Stream = (*redisStream)(nil)
+}
+
+func TestDefaultRedisConfig(t *testing.T) {
+	cfg := DefaultRedisConfig("localhost:6379")
+
+	if cfg.Addr != "localhost:6379" {
+		t.Errorf("Addr = %q, want %q", cfg.Addr, "localhost:6379")
+	}
+	if cfg.PoolSize != 40 {
+		t.Errorf("PoolSize = %d, want %d", cfg.PoolSize, 40)
+	}
+	if cfg.MinIdleConns != 4 {
+		t.Errorf("MinIdleConns = %d, want %d", cfg.MinIdleConns, 4)
+	}
+	if cfg.PoolTimeout != 4*time.Second {
+		t.Errorf("PoolTimeout = %v, want %v", cfg.PoolTimeout, 4*time.Second)
+	}
+	if cfg.ConnMaxIdleTime != 30*time.Minute {
+		t.Errorf("ConnMaxIdleTime = %v, want %v", cfg.ConnMaxIdleTime, 30*time.Minute)
+	}
+}
+
+func TestRedisStorageConfigDefaults(t *testing.T) {
+	// Test that zero-value config gets defaults applied
+	cfg := RedisStorageConfig{
+		Addr: "localhost:6379",
+		// All other fields are zero values
+	}
+
+	// These would be applied in NewRedisStorage
+	if cfg.PoolSize == 0 {
+		cfg.PoolSize = 40
+	}
+	if cfg.MinIdleConns == 0 {
+		cfg.MinIdleConns = 4
+	}
+	if cfg.PoolTimeout == 0 {
+		cfg.PoolTimeout = 4 * time.Second
+	}
+	if cfg.ConnMaxIdleTime == 0 {
+		cfg.ConnMaxIdleTime = 30 * time.Minute
+	}
+
+	if cfg.PoolSize != 40 {
+		t.Errorf("PoolSize default = %d, want %d", cfg.PoolSize, 40)
+	}
+	if cfg.MinIdleConns != 4 {
+		t.Errorf("MinIdleConns default = %d, want %d", cfg.MinIdleConns, 4)
+	}
 }

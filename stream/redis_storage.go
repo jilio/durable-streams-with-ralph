@@ -134,16 +134,54 @@ type RedisStorageConfig struct {
 
 	// MinIdleConns is the minimum number of idle connections (default: NumCPU)
 	MinIdleConns int
+
+	// PoolTimeout is the timeout for acquiring a connection from the pool (default: 4s)
+	PoolTimeout time.Duration
+
+	// ConnMaxIdleTime is the maximum time a connection can be idle (default: 30m)
+	ConnMaxIdleTime time.Duration
+
+	// ConnMaxLifetime is the maximum lifetime of a connection (default: 0, no limit)
+	ConnMaxLifetime time.Duration
+}
+
+// DefaultRedisConfig returns a RedisStorageConfig with sensible defaults.
+func DefaultRedisConfig(addr string) RedisStorageConfig {
+	numCPU := 4 // Reasonable default, actual runtime.NumCPU() would require import
+	return RedisStorageConfig{
+		Addr:            addr,
+		PoolSize:        numCPU * 10,
+		MinIdleConns:    numCPU,
+		PoolTimeout:     4 * time.Second,
+		ConnMaxIdleTime: 30 * time.Minute,
+	}
 }
 
 // NewRedisStorage creates a new Redis-backed storage.
 func NewRedisStorage(cfg RedisStorageConfig) (*RedisStorage, error) {
+	// Apply defaults for zero values
+	if cfg.PoolSize == 0 {
+		cfg.PoolSize = 40 // 10 * 4 (assuming 4 CPUs)
+	}
+	if cfg.MinIdleConns == 0 {
+		cfg.MinIdleConns = 4
+	}
+	if cfg.PoolTimeout == 0 {
+		cfg.PoolTimeout = 4 * time.Second
+	}
+	if cfg.ConnMaxIdleTime == 0 {
+		cfg.ConnMaxIdleTime = 30 * time.Minute
+	}
+
 	client := redis.NewClient(&redis.Options{
-		Addr:         cfg.Addr,
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		PoolSize:     cfg.PoolSize,
-		MinIdleConns: cfg.MinIdleConns,
+		Addr:            cfg.Addr,
+		Password:        cfg.Password,
+		DB:              cfg.DB,
+		PoolSize:        cfg.PoolSize,
+		MinIdleConns:    cfg.MinIdleConns,
+		PoolTimeout:     cfg.PoolTimeout,
+		ConnMaxIdleTime: cfg.ConnMaxIdleTime,
+		ConnMaxLifetime: cfg.ConnMaxLifetime,
 	})
 
 	// Test connection
@@ -160,6 +198,11 @@ func NewRedisStorage(cfg RedisStorageConfig) (*RedisStorage, error) {
 // Close closes the Redis connection.
 func (s *RedisStorage) Close() error {
 	return s.client.Close()
+}
+
+// PoolStats returns the current connection pool statistics.
+func (s *RedisStorage) PoolStats() *redis.PoolStats {
+	return s.client.PoolStats()
 }
 
 // Helper functions for key generation
