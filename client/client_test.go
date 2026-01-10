@@ -618,3 +618,121 @@ func TestClient_SubscribeOffset(t *testing.T) {
 
 	sub.Cancel()
 }
+
+func TestClient_CreateWithTTL(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := server.New(storage)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := New(ts.URL + "/test/stream")
+
+	err := c.Create(ctx, CreateOptions{
+		ContentType: "application/json",
+		TTLSeconds:  3600,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	exists, _ := storage.Exists(ctx, "/test/stream")
+	if !exists {
+		t.Error("Stream was not created")
+	}
+}
+
+func TestClient_CreateWithExpiresAt(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := server.New(storage)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := New(ts.URL + "/test/stream")
+
+	err := c.Create(ctx, CreateOptions{
+		ContentType: "application/json",
+		ExpiresAt:   "2030-01-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	exists, _ := storage.Exists(ctx, "/test/stream")
+	if !exists {
+		t.Error("Stream was not created")
+	}
+}
+
+func TestClient_ReadWithOffset(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := server.New(storage)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create stream with data
+	storage.Create(ctx, stream.StreamConfig{
+		Path:        "/test/stream",
+		ContentType: "application/json",
+	})
+	str, _ := storage.Get(ctx, "/test/stream")
+	str.Append(ctx, []byte(`{"event":"test"}`))
+
+	c := New(ts.URL + "/test/stream")
+
+	// Read with empty offset should work
+	result, err := c.Read(ctx, "")
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if len(result.Messages) != 1 {
+		t.Errorf("len(Messages) = %d, want 1", len(result.Messages))
+	}
+}
+
+func TestClient_HeadCacheControl(t *testing.T) {
+	storage := stream.NewMemoryStorage()
+	srv := server.New(storage)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	storage.Create(ctx, stream.StreamConfig{
+		Path:        "/test/stream",
+		ContentType: "application/json",
+	})
+
+	c := New(ts.URL + "/test/stream")
+	result, err := c.Head(ctx)
+	if err != nil {
+		t.Fatalf("Head() error = %v", err)
+	}
+
+	// HEAD should have Cache-Control: no-store
+	if result.CacheControl != "no-store" {
+		t.Errorf("CacheControl = %q, want %q", result.CacheControl, "no-store")
+	}
+}
+
+func TestClient_WithCustomHTTPClient(t *testing.T) {
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	c := New("http://example.com/stream", WithHTTPClient(httpClient))
+
+	if c.HTTPClient != httpClient {
+		t.Error("HTTPClient should be set")
+	}
+}
+
+func TestClient_DefaultHTTPClient(t *testing.T) {
+	c := New("http://example.com/stream")
+
+	// httpClient() should return default client
+	client := c.httpClient()
+	if client != http.DefaultClient {
+		t.Error("httpClient() should return http.DefaultClient when HTTPClient is nil")
+	}
+}
