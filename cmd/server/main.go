@@ -18,10 +18,24 @@ import (
 func main() {
 	port := flag.Int("port", 8080, "HTTP server port")
 	timeout := flag.Duration("timeout", 30*time.Second, "Long-poll timeout")
+	redisAddr := flag.String("redis", "", "Redis address (e.g., localhost:6379). If empty, uses in-memory storage")
 	flag.Parse()
 
-	// Create storage and server
-	storage := stream.NewMemoryStorage()
+	// Create storage
+	var storage stream.StreamStorage
+	if *redisAddr != "" {
+		cfg := stream.DefaultRedisConfig(*redisAddr)
+		redisStorage, err := stream.NewRedisStorage(cfg)
+		if err != nil {
+			log.Fatalf("Failed to connect to Redis at %s: %v", *redisAddr, err)
+		}
+		storage = redisStorage
+		log.Printf("Using Redis storage: %s", *redisAddr)
+	} else {
+		storage = stream.NewMemoryStorage()
+		log.Println("Using in-memory storage")
+	}
+
 	srv := server.NewWithOptions(storage, "", *timeout)
 
 	// Setup HTTP server
@@ -46,8 +60,8 @@ func main() {
 		close(done)
 	}()
 
-	log.Printf("Durable Streams server starting on %s\n", addr)
-	log.Printf("Long-poll timeout: %v\n", *timeout)
+	log.Printf("Durable Streams server starting on %s", addr)
+	log.Printf("Long-poll timeout: %v", *timeout)
 
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
