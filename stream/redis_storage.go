@@ -430,7 +430,7 @@ func (s *RedisStorage) Head(ctx context.Context, path string) (*StreamMetadata, 
 
 	entries, _ := lastEntryCmd.Result()
 
-	var nextOffset Offset = "0_0"
+	var nextOffset Offset = "0000000000000000_0000000000000000"
 	if len(entries) > 0 {
 		// Get the offset from the last message
 		if offsetStr, ok := entries[0].Values[redisFieldOffset].(string); ok {
@@ -469,7 +469,7 @@ func (s *RedisStorage) AppendBatch(ctx context.Context, path string, messages []
 	// Initialize offset generator
 	if rs.offsetGen == nil {
 		currentOffset := rs.CurrentOffset()
-		if currentOffset != "0_0" && currentOffset != "" {
+		if currentOffset != InitialOffset && currentOffset != "" {
 			rs.offsetGen = NewOffsetGeneratorFrom(currentOffset)
 		} else {
 			rs.offsetGen = NewOffsetGenerator()
@@ -526,13 +526,14 @@ func (r *redisStream) CurrentOffset() Offset {
 	// Get the last entry to find current offset
 	entries, err := r.storage.client.XRevRangeN(ctx, sk, "+", "-", 1).Result()
 	if err != nil || len(entries) == 0 {
-		return Offset("0_0")
+		// Return properly formatted zero offset for empty streams
+		return Offset("0000000000000000_0000000000000000")
 	}
 
 	if offsetStr, ok := entries[0].Values[redisFieldOffset].(string); ok {
 		return Offset(offsetStr)
 	}
-	return Offset("0_0")
+	return Offset("0000000000000000_0000000000000000")
 }
 
 func (r *redisStream) Append(ctx context.Context, data []byte) (Offset, error) {
@@ -543,7 +544,7 @@ func (r *redisStream) Append(ctx context.Context, data []byte) (Offset, error) {
 	if r.offsetGen == nil {
 		// Initialize from current stream state
 		currentOffset := r.CurrentOffset()
-		if currentOffset != "0_0" && currentOffset != "" {
+		if currentOffset != InitialOffset && currentOffset != "" {
 			r.offsetGen = NewOffsetGeneratorFrom(currentOffset)
 		} else {
 			r.offsetGen = NewOffsetGenerator()
@@ -739,34 +740,25 @@ func (r *redisStream) ReadFrom(ctx context.Context, offset Offset) (Batch, error
 func (r *redisStream) WaitForMessages(ctx context.Context, offset Offset, timeout time.Duration) WaitResult {
 	sk := streamKey(r.path)
 
-	// First, check if there are already messages after the given offset
-	batch, err := r.ReadFrom(ctx, offset)
-	if err == nil && len(batch.Messages) > 0 {
-		return WaitResult{Messages: batch.Messages, TimedOut: false}
-	}
-
-	// Find the last Redis stream ID to use as starting point for XREAD BLOCK
-	// We need to find the Redis ID corresponding to our offset
-	lastRedisID := "0-0" // Start from beginning if no messages
-
-	// Get all entries to find the one matching our offset
-	entries, err := r.storage.client.XRange(ctx, sk, "-", "+").Result()
-	if err == nil && len(entries) > 0 {
-		// Find the entry with our offset or the last entry
-		for _, entry := range entries {
-			if msgOffset, ok := entry.Values[redisFieldOffset].(string); ok {
-				if Offset(msgOffset).Compare(offset) <= 0 {
-					lastRedisID = entry.ID
-				}
+	// Quick check: get the last entry to see if there are any messages after offset
+	// This is O(1) instead of O(n) for XRange("-", "+")
+	// Also capture the Redis stream ID for use in XREAD
+	lastRedisID := "0-0"
+	lastEntries, err := r.storage.client.XRevRangeN(ctx, sk, "+", "-", 1).Result()
+	if err == nil && len(lastEntries) > 0 {
+		lastRedisID = lastEntries[0].ID
+		lastMsgOffset := Offset(lastEntries[0].Values[redisFieldOffset].(string))
+		// If the last message is after our offset, do a full read
+		if offset.IsStart() || lastMsgOffset.Compare(offset) > 0 {
+			batch, err := r.ReadFrom(ctx, offset)
+			if err == nil && len(batch.Messages) > 0 {
+				return WaitResult{Messages: batch.Messages, TimedOut: false}
 			}
 		}
-		// If offset is beyond all entries, use the last entry's ID
-		if lastRedisID == "0-0" && len(entries) > 0 {
-			lastRedisID = entries[len(entries)-1].ID
-		}
 	}
 
-	// Use XREAD BLOCK for efficient waiting
+	// Wait for new messages using the last known Redis stream ID
+	// This avoids missing messages added between our check and XREAD
 	timeoutMs := timeout.Milliseconds()
 	if timeoutMs <= 0 {
 		timeoutMs = 1 // Minimum 1ms

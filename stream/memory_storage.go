@@ -22,6 +22,7 @@ type memoryStreamData struct {
 	lastSeq   string // Last accepted Stream-Seq value
 	producers map[string]*ProducerState
 	mu        sync.RWMutex
+	cond      *sync.Cond // Condition variable for long-poll notification
 }
 
 // memoryStream is a handle to an in-memory stream.
@@ -70,13 +71,15 @@ func (s *MemoryStorage) Create(ctx context.Context, config StreamConfig) error {
 		}
 	}
 
-	s.streams[config.Path] = &memoryStreamData{
+	data := &memoryStreamData{
 		config:    config,
 		messages:  make([]Message, 0),
 		offsetGen: NewOffsetGenerator(),
 		createdAt: time.Now().UnixMilli(),
 		producers: make(map[string]*ProducerState),
 	}
+	data.cond = sync.NewCond(&data.mu)
+	s.streams[config.Path] = data
 
 	return nil // New stream created
 }
@@ -106,13 +109,15 @@ func (s *MemoryStorage) CreateOrMatch(ctx context.Context, config StreamConfig) 
 		}
 	}
 
-	s.streams[config.Path] = &memoryStreamData{
+	data := &memoryStreamData{
 		config:    config,
 		messages:  make([]Message, 0),
 		offsetGen: NewOffsetGenerator(),
 		createdAt: time.Now().UnixMilli(),
 		producers: make(map[string]*ProducerState),
 	}
+	data.cond = sync.NewCond(&data.mu)
+	s.streams[config.Path] = data
 
 	return true, nil
 }
@@ -242,7 +247,6 @@ func (m *memoryStream) CurrentOffset() Offset {
 // Append writes data to the stream and returns the assigned offset.
 func (m *memoryStream) Append(ctx context.Context, data []byte) (Offset, error) {
 	m.data.mu.Lock()
-	defer m.data.mu.Unlock()
 
 	// Generate the next offset
 	offset := m.data.offsetGen.Next(len(data))
@@ -251,6 +255,10 @@ func (m *memoryStream) Append(ctx context.Context, data []byte) (Offset, error) 
 	msg := NewMessage(data, offset, time.Now())
 	m.data.messages = append(m.data.messages, msg)
 
+	// Notify waiting long-polls
+	m.data.cond.Broadcast()
+	m.data.mu.Unlock()
+
 	return offset, nil
 }
 
@@ -258,10 +266,10 @@ func (m *memoryStream) Append(ctx context.Context, data []byte) (Offset, error) 
 // Uses lexicographic string comparison for sequence ordering.
 func (m *memoryStream) AppendWithSeq(ctx context.Context, data []byte, seq string) (Offset, error) {
 	m.data.mu.Lock()
-	defer m.data.mu.Unlock()
 
 	// Check sequence ordering (lexicographic comparison)
 	if seq != "" && m.data.lastSeq != "" && seq <= m.data.lastSeq {
+		m.data.mu.Unlock()
 		return "", ErrSeqConflict
 	}
 
@@ -277,6 +285,10 @@ func (m *memoryStream) AppendWithSeq(ctx context.Context, data []byte, seq strin
 		m.data.lastSeq = seq
 	}
 
+	// Notify waiting long-polls
+	m.data.cond.Broadcast()
+	m.data.mu.Unlock()
+
 	return offset, nil
 }
 
@@ -284,7 +296,6 @@ func (m *memoryStream) AppendWithSeq(ctx context.Context, data []byte, seq strin
 // Returns the offset and producer validation result.
 func (m *memoryStream) AppendWithProducer(ctx context.Context, data []byte, producerId string, epoch, seq int64) (Offset, *ProducerResult) {
 	m.data.mu.Lock()
-	defer m.data.mu.Unlock()
 
 	now := time.Now().UnixMilli()
 
@@ -298,6 +309,7 @@ func (m *memoryStream) AppendWithProducer(ctx context.Context, data []byte, prod
 	// New producer - accept if seq is 0
 	if state == nil {
 		if seq != 0 {
+			m.data.mu.Unlock()
 			return "", &ProducerResult{
 				Status:      ProducerStatusSequenceGap,
 				ExpectedSeq: 0,
@@ -313,11 +325,14 @@ func (m *memoryStream) AppendWithProducer(ctx context.Context, data []byte, prod
 			LastSeq:     0,
 			LastUpdated: now,
 		}
+		m.data.cond.Broadcast()
+		m.data.mu.Unlock()
 		return offset, &ProducerResult{Status: ProducerStatusAccepted}
 	}
 
 	// Epoch validation (client-declared, server-validated)
 	if epoch < state.Epoch {
+		m.data.mu.Unlock()
 		return "", &ProducerResult{
 			Status:       ProducerStatusStaleEpoch,
 			CurrentEpoch: state.Epoch,
@@ -327,6 +342,7 @@ func (m *memoryStream) AppendWithProducer(ctx context.Context, data []byte, prod
 	if epoch > state.Epoch {
 		// New epoch must start at seq=0
 		if seq != 0 {
+			m.data.mu.Unlock()
 			return "", &ProducerResult{Status: ProducerStatusInvalidEpochSeq}
 		}
 		// Accept new epoch
@@ -338,11 +354,14 @@ func (m *memoryStream) AppendWithProducer(ctx context.Context, data []byte, prod
 			LastSeq:     0,
 			LastUpdated: now,
 		}
+		m.data.cond.Broadcast()
+		m.data.mu.Unlock()
 		return offset, &ProducerResult{Status: ProducerStatusAccepted}
 	}
 
 	// Same epoch: sequence validation
 	if seq <= state.LastSeq {
+		m.data.mu.Unlock()
 		return "", &ProducerResult{
 			Status:      ProducerStatusDuplicate,
 			IsDuplicate: true,
@@ -357,10 +376,13 @@ func (m *memoryStream) AppendWithProducer(ctx context.Context, data []byte, prod
 		m.data.messages = append(m.data.messages, msg)
 		state.LastSeq = seq
 		state.LastUpdated = now
+		m.data.cond.Broadcast()
+		m.data.mu.Unlock()
 		return offset, &ProducerResult{Status: ProducerStatusAccepted}
 	}
 
 	// Sequence gap
+	m.data.mu.Unlock()
 	return "", &ProducerResult{
 		Status:      ProducerStatusSequenceGap,
 		ExpectedSeq: state.LastSeq + 1,
@@ -388,37 +410,64 @@ func (m *memoryStream) ReadFrom(ctx context.Context, offset Offset) (Batch, erro
 
 // WaitForMessages blocks until new messages are available or timeout expires.
 func (m *memoryStream) WaitForMessages(ctx context.Context, offset Offset, timeout time.Duration) WaitResult {
-	deadline := time.Now().Add(timeout)
-	pollInterval := 10 * time.Millisecond
+	// First check if there are already new messages (fast path)
+	m.data.mu.Lock()
+	msgs := m.getMessagesAfterOffset(offset)
+	if len(msgs) > 0 {
+		m.data.mu.Unlock()
+		return WaitResult{Messages: msgs, TimedOut: false}
+	}
 
-	for {
-		// Check for new messages
-		m.data.mu.RLock()
-		var msgs []Message
-		for _, msg := range m.data.messages {
-			if offset.IsStart() || msg.Offset.Compare(offset) > 0 {
-				msgs = append(msgs, msg)
-			}
-		}
-		m.data.mu.RUnlock()
+	// Set up timeout and context cancellation to wake us up
+	done := make(chan struct{})
+	timedOut := false
 
-		if len(msgs) > 0 {
-			return WaitResult{Messages: msgs, TimedOut: false}
-		}
+	// Timer for timeout
+	timer := time.AfterFunc(timeout, func() {
+		m.data.mu.Lock()
+		timedOut = true
+		m.data.cond.Broadcast()
+		m.data.mu.Unlock()
+	})
+	defer timer.Stop()
 
-		// Check timeout
-		if time.Now().After(deadline) {
-			return WaitResult{TimedOut: true}
-		}
-
-		// Check context cancellation
+	// Goroutine for context cancellation
+	go func() {
 		select {
 		case <-ctx.Done():
-			return WaitResult{TimedOut: true}
-		case <-time.After(pollInterval):
-			// Continue polling
+			m.data.mu.Lock()
+			timedOut = true
+			m.data.cond.Broadcast()
+			m.data.mu.Unlock()
+		case <-done:
+		}
+	}()
+	defer close(done) // Signal context goroutine to exit
+
+	// Wait loop - cond.Wait releases lock, waits for broadcast, reacquires lock
+	for !timedOut {
+		m.data.cond.Wait()
+		msgs = m.getMessagesAfterOffset(offset)
+		if len(msgs) > 0 {
+			m.data.mu.Unlock()
+			return WaitResult{Messages: msgs, TimedOut: false}
 		}
 	}
+
+	m.data.mu.Unlock()
+	return WaitResult{TimedOut: true}
+}
+
+// getMessagesAfterOffset returns messages after the given offset.
+// Caller must hold the lock.
+func (m *memoryStream) getMessagesAfterOffset(offset Offset) []Message {
+	var msgs []Message
+	for _, msg := range m.data.messages {
+		if offset.IsStart() || msg.Offset.Compare(offset) > 0 {
+			msgs = append(msgs, msg)
+		}
+	}
+	return msgs
 }
 
 // Ensure interfaces are implemented
